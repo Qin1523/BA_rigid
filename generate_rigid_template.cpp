@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <unistd.h>
+#include <set>
 
 #include <opencv2/core.hpp>
 
@@ -29,7 +30,21 @@ struct Obs2 {
     long long frame;
 };
 
+struct PartSampleStats {
+    size_t raw_candidates = 0;
+    size_t rejected_invalid = 0;
+    size_t rejected_reproj = 0;
+    size_t rejected_angle = 0;
+    size_t accepted = 0;
+};
+
+struct SampleCollectionResult {
+    unordered_map<string, vector<array<double, 3>>> part_samples;
+    unordered_map<string, PartSampleStats> stats;
+};
+
 string remove_bom(const string& str);
+double compute_median(vector<double> values);
 
 bool file_exists(const string& path) {
     struct stat info;
@@ -52,6 +67,15 @@ string join_path(const string& base, const string& child) {
     if (child.empty()) return base;
     if (base.back() == '/') return base + child;
     return base + "/" + child;
+}
+
+string replace_extension(const string& path, const string& new_ext) {
+    size_t slash_pos = path.find_last_of("/\\");
+    size_t dot_pos = path.find_last_of('.');
+    if (dot_pos == string::npos || (slash_pos != string::npos && dot_pos < slash_pos)) {
+        return path + new_ext;
+    }
+    return path.substr(0, dot_pos) + new_ext;
 }
 
 string trim_copy(const string& str) {
@@ -340,8 +364,254 @@ cv::Point3d triangulate_DLT(const vector<pair<int, cv::Point2d>>& views,
     );
 }
 
+cv::Point2d project_point(const cv::Point3d& X, const cv::Mat& P) {
+    cv::Mat X_homo(4, 1, CV_64F);
+    X_homo.at<double>(0, 0) = X.x;
+    X_homo.at<double>(1, 0) = X.y;
+    X_homo.at<double>(2, 0) = X.z;
+    X_homo.at<double>(3, 0) = 1.0;
+
+    cv::Mat x = P * X_homo;
+    const double w = x.at<double>(2, 0);
+    if (!std::isfinite(w) || fabs(w) < 1e-12) {
+        return cv::Point2d(numeric_limits<double>::quiet_NaN(),
+                           numeric_limits<double>::quiet_NaN());
+    }
+
+    return cv::Point2d(x.at<double>(0, 0) / w, x.at<double>(1, 0) / w);
+}
+
+double reproj_error_px(const cv::Point3d& X,
+                       const vector<pair<int, cv::Point2d>>& views,
+                       const vector<cv::Mat>& Ps) {
+    if (views.empty()) {
+        return numeric_limits<double>::infinity();
+    }
+
+    double error_sum = 0.0;
+    for (const auto& view : views) {
+        const cv::Point2d projected = project_point(X, Ps[view.first]);
+        if (!std::isfinite(projected.x) || !std::isfinite(projected.y)) {
+            return numeric_limits<double>::infinity();
+        }
+
+        const double du = projected.x - view.second.x;
+        const double dv = projected.y - view.second.y;
+        error_sum += sqrt(du * du + dv * dv);
+    }
+
+    return error_sum / static_cast<double>(views.size());
+}
+
+cv::Point3d camera_center_from_P(const cv::Mat& P) {
+    cv::Mat w, u, vt;
+    cv::SVD::compute(P, w, u, vt);
+
+    cv::Mat C_homo = vt.row(vt.rows - 1).t();
+    const double w_h = C_homo.at<double>(3, 0);
+    if (!std::isfinite(w_h) || fabs(w_h) < 1e-12) {
+        return cv::Point3d(numeric_limits<double>::quiet_NaN(),
+                           numeric_limits<double>::quiet_NaN(),
+                           numeric_limits<double>::quiet_NaN());
+    }
+
+    return cv::Point3d(C_homo.at<double>(0, 0) / w_h,
+                       C_homo.at<double>(1, 0) / w_h,
+                       C_homo.at<double>(2, 0) / w_h);
+}
+
+double angle_between_rays_deg(const cv::Point3d& X,
+                              const cv::Point3d& C1,
+                              const cv::Point3d& C2) {
+    const cv::Point3d r1 = X - C1;
+    const cv::Point3d r2 = X - C2;
+
+    const double n1 = sqrt(r1.dot(r1));
+    const double n2 = sqrt(r2.dot(r2));
+    if (!std::isfinite(n1) || !std::isfinite(n2) || n1 < 1e-12 || n2 < 1e-12) {
+        return 0.0;
+    }
+
+    double cos_angle = r1.dot(r2) / (n1 * n2);
+    cos_angle = std::max(-1.0, std::min(1.0, cos_angle));
+    return acos(cos_angle) * 180.0 / M_PI;
+}
+
+double max_triangulation_angle_deg(const cv::Point3d& X,
+                                   const vector<pair<int, cv::Point2d>>& views,
+                                   const vector<cv::Point3d>& camera_centers) {
+    if (views.size() < 2) {
+        return 0.0;
+    }
+
+    double max_angle = 0.0;
+    for (size_t i = 0; i < views.size(); i++) {
+        for (size_t j = i + 1; j < views.size(); j++) {
+            const cv::Point3d& C1 = camera_centers[views[i].first];
+            const cv::Point3d& C2 = camera_centers[views[j].first];
+            const double angle = angle_between_rays_deg(X, C1, C2);
+            max_angle = std::max(max_angle, angle);
+        }
+    }
+
+    return max_angle;
+}
+
+array<double, 3> compute_coordinate_median_point(const vector<array<double, 3>>& samples) {
+    vector<double> xs;
+    vector<double> ys;
+    vector<double> zs;
+    xs.reserve(samples.size());
+    ys.reserve(samples.size());
+    zs.reserve(samples.size());
+
+    for (const auto& sample : samples) {
+        xs.push_back(sample[0]);
+        ys.push_back(sample[1]);
+        zs.push_back(sample[2]);
+    }
+
+    return {compute_median(xs), compute_median(ys), compute_median(zs)};
+}
+
+double euclidean_distance_3d(const array<double, 3>& a, const array<double, 3>& b) {
+    const double dx = a[0] - b[0];
+    const double dy = a[1] - b[1];
+    const double dz = a[2] - b[2];
+    return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+array<double, 3> vec_sub(const array<double, 3>& a, const array<double, 3>& b) {
+    return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
+}
+
+array<double, 3> vec_add(const array<double, 3>& a, const array<double, 3>& b) {
+    return {a[0] + b[0], a[1] + b[1], a[2] + b[2]};
+}
+
+array<double, 3> vec_scale(const array<double, 3>& v, double s) {
+    return {v[0] * s, v[1] * s, v[2] * s};
+}
+
+double vec_dot(const array<double, 3>& a, const array<double, 3>& b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+array<double, 3> vec_cross(const array<double, 3>& a, const array<double, 3>& b) {
+    return {
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]
+    };
+}
+
+double vec_norm(const array<double, 3>& v) {
+    return sqrt(vec_dot(v, v));
+}
+
+bool normalize_vec(array<double, 3>& v, double eps = 1e-8) {
+    const double n = vec_norm(v);
+    if (!std::isfinite(n) || n < eps) {
+        return false;
+    }
+    v[0] /= n;
+    v[1] /= n;
+    v[2] /= n;
+    return true;
+}
+
+array<double, 3> point3d_to_array(const cv::Point3d& p) {
+    return {p.x, p.y, p.z};
+}
+
+bool get_left_right_reference(
+    const unordered_map<string, array<double, 3>>& frame_points_world,
+    array<double, 3>& left_right_vec,
+    string& source_name) {
+
+    auto left_ear = frame_points_world.find("left ear");
+    auto right_ear = frame_points_world.find("right ear");
+    if (left_ear != frame_points_world.end() && right_ear != frame_points_world.end()) {
+        left_right_vec = vec_sub(left_ear->second, right_ear->second);
+        source_name = "ears";
+        return true;
+    }
+
+    auto left_front_paw = frame_points_world.find("left front paw");
+    auto right_front_paw = frame_points_world.find("right front paw");
+    if (left_front_paw != frame_points_world.end() && right_front_paw != frame_points_world.end()) {
+        left_right_vec = vec_sub(left_front_paw->second, right_front_paw->second);
+        source_name = "front paws";
+        return true;
+    }
+
+    auto left_hind_paw = frame_points_world.find("left hind paw");
+    auto right_hind_paw = frame_points_world.find("right hind paw");
+    if (left_hind_paw != frame_points_world.end() && right_hind_paw != frame_points_world.end()) {
+        left_right_vec = vec_sub(left_hind_paw->second, right_hind_paw->second);
+        source_name = "hind paws";
+        return true;
+    }
+
+    return false;
+}
+
+bool build_frame_alignment_axes(
+    const unordered_map<string, array<double, 3>>& frame_points_world,
+    const array<double, 3>& left_right_vec,
+    array<double, 3>& origin,
+    array<double, 3>& x_axis,
+    array<double, 3>& y_axis,
+    array<double, 3>& z_axis) {
+
+    auto head_center_it = frame_points_world.find("head center");
+    auto tail_base_it = frame_points_world.find("tail base");
+    if (head_center_it == frame_points_world.end() || tail_base_it == frame_points_world.end()) {
+        return false;
+    }
+
+    origin = head_center_it->second;
+    y_axis = vec_sub(tail_base_it->second, head_center_it->second);
+    if (!normalize_vec(y_axis)) {
+        return false;
+    }
+
+    const array<double, 3> x_parallel = vec_scale(y_axis, vec_dot(left_right_vec, y_axis));
+    x_axis = vec_sub(left_right_vec, x_parallel);
+    if (!normalize_vec(x_axis)) {
+        return false;
+    }
+
+    z_axis = vec_cross(x_axis, y_axis);
+    if (!normalize_vec(z_axis)) {
+        return false;
+    }
+
+    // re-orthogonalize x
+    x_axis = vec_cross(y_axis, z_axis);
+    if (!normalize_vec(x_axis)) return false;
+
+    return true;
+}
+
+array<double, 3> transform_world_to_local(
+    const array<double, 3>& X_world,
+    const array<double, 3>& origin,
+    const array<double, 3>& x_axis,
+    const array<double, 3>& y_axis,
+    const array<double, 3>& z_axis) {
+
+    const array<double, 3> d = vec_sub(X_world, origin);
+    return {
+        vec_dot(d, x_axis),
+        vec_dot(d, y_axis),
+        vec_dot(d, z_axis)
+    };
+}
+
 void save_template(const string& path,
-                   const unordered_map<string, array<double, 3>>& model) {
+                   const unordered_map<string, array<double, 3>>& model,
+                   const vector<string>& part_order) {
     ofstream ofs(path);
     if (!ofs.is_open()) {
         cerr << "WARNING: Cannot write " << path << endl;
@@ -349,14 +619,255 @@ void save_template(const string& path,
     }
 
     ofs << "part,X,Y,Z\n";
-    for (const auto& kv : model) {
-        ofs << kv.first << ","
-            << kv.second[0] << ","
-            << kv.second[1] << ","
-            << kv.second[2] << "\n";
+    for (const string& part : part_order) {
+        auto it = model.find(part);
+        if (it == model.end()) {
+            continue;
+        }
+
+        ofs << part << ","
+            << it->second[0] << ","
+            << it->second[1] << ","
+            << it->second[2] << "\n";
     }
 
     cout << "Saved template to " << path << endl;
+}
+
+void save_template_point_cloud_ply(const string& path,
+                                   const unordered_map<string, array<double, 3>>& model,
+                                   const vector<string>& part_order) {
+    ofstream ofs(path);
+    if (!ofs.is_open()) {
+        cerr << "WARNING: Cannot write point cloud " << path << endl;
+        return;
+    }
+
+    size_t vertex_count = 0;
+    for (const string& part : part_order) {
+        if (model.find(part) != model.end()) {
+            vertex_count++;
+        }
+    }
+
+    ofs << "ply\n";
+    ofs << "format ascii 1.0\n";
+    ofs << "comment Generated from final rigid template output\n";
+    ofs << "element vertex " << vertex_count << "\n";
+    ofs << "property float x\n";
+    ofs << "property float y\n";
+    ofs << "property float z\n";
+    ofs << "end_header\n";
+
+    for (const string& part : part_order) {
+        auto it = model.find(part);
+        if (it == model.end()) {
+            continue;
+        }
+
+        ofs << it->second[0] << " "
+            << it->second[1] << " "
+            << it->second[2] << "\n";
+    }
+
+    cout << "Saved template point cloud to " << path << endl;
+}
+
+vector<pair<string, string>> build_default_mouse_skeleton_edges(
+    const unordered_map<string, array<double, 3>>& model) {
+
+    const vector<pair<string, string>> candidate_edges = {
+        {"nose", "head center"},
+        {"left ear", "head center"},
+        {"right ear", "head center"},
+        {"nose", "left ear"},
+        {"nose", "right ear"},
+        {"head center", "tail base"},
+        {"tail root", "tail base"},
+        {"head center", "left front paw"},
+        {"head center", "right front paw"},
+        {"tail base", "left hind paw"},
+        {"tail base", "right hind paw"}
+    };
+
+    vector<pair<string, string>> edges;
+    for (const auto& edge : candidate_edges) {
+        if (model.find(edge.first) != model.end() && model.find(edge.second) != model.end()) {
+            edges.push_back(edge);
+        }
+    }
+    return edges;
+}
+
+vector<array<double, 3>> interpolate_edge_points(const array<double, 3>& a,
+                                                 const array<double, 3>& b,
+                                                 int num_points) {
+    num_points = std::max(num_points, 2);
+
+    vector<array<double, 3>> points;
+    points.reserve(static_cast<size_t>(num_points));
+    for (int i = 0; i < num_points; i++) {
+        const double alpha = static_cast<double>(i) / static_cast<double>(num_points - 1);
+        points.push_back({
+            (1.0 - alpha) * a[0] + alpha * b[0],
+            (1.0 - alpha) * a[1] + alpha * b[1],
+            (1.0 - alpha) * a[2] + alpha * b[2]
+        });
+    }
+    return points;
+}
+
+void save_template_skeleton_html(const string& path,
+                                 const unordered_map<string, array<double, 3>>& model,
+                                 const vector<string>& part_order) {
+    ofstream ofs(path);
+    if (!ofs.is_open()) {
+        cerr << "WARNING: Cannot write skeleton html " << path << endl;
+        return;
+    }
+
+    vector<string> parts;
+    vector<double> xs;
+    vector<double> ys;
+    vector<double> zs;
+    vector<string> node_colors;
+    for (const string& part : part_order) {
+        auto it = model.find(part);
+        if (it == model.end()) {
+            continue;
+        }
+        parts.push_back(part);
+        xs.push_back(it->second[0]);
+        ys.push_back(it->second[1]);
+        zs.push_back(it->second[2]);
+
+        if (part == "nose" || part == "tail root") {
+            node_colors.push_back("white");
+        } else if (part == "head center" || part == "tail base") {
+            node_colors.push_back("gold");
+        } else if (part == "left ear" || part == "left front paw" || part == "left hind paw") {
+            node_colors.push_back("red");
+        } else if (part == "right ear" || part == "right front paw" || part == "right hind paw") {
+            node_colors.push_back("green");
+        } else {
+            node_colors.push_back("gold");
+        }
+    }
+
+    const vector<pair<string, string>> edges = build_default_mouse_skeleton_edges(model);
+    vector<array<double, 3>> dotted_edge_points;
+    for (const auto& edge : edges) {
+        const auto& a = model.at(edge.first);
+        const auto& b = model.at(edge.second);
+        const vector<array<double, 3>> edge_points = interpolate_edge_points(a, b, 40);
+        dotted_edge_points.insert(dotted_edge_points.end(), edge_points.begin(), edge_points.end());
+    }
+
+    ofs << "<!DOCTYPE html>\n";
+    ofs << "<html lang=\"en\">\n";
+    ofs << "<head>\n";
+    ofs << "  <meta charset=\"utf-8\">\n";
+    ofs << "  <title>Mouse Template Skeleton</title>\n";
+    ofs << "  <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>\n";
+    ofs << "</head>\n";
+    ofs << "<body>\n";
+    ofs << "  <div id=\"plot\" style=\"width: 100%; height: 95vh;\"></div>\n";
+    ofs << "  <script>\n";
+
+    ofs << "    const nodeTrace = {\n";
+    ofs << "      type: 'scatter3d',\n";
+    ofs << "      mode: 'markers',\n";
+    ofs << "      x: [";
+    for (size_t i = 0; i < xs.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << xs[i];
+    }
+    ofs << "],\n";
+
+    ofs << "      y: [";
+    for (size_t i = 0; i < ys.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << ys[i];
+    }
+    ofs << "],\n";
+
+    ofs << "      z: [";
+    for (size_t i = 0; i < zs.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << zs[i];
+    }
+    ofs << "],\n";
+
+    ofs << "      text: [";
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << "'" << parts[i] << "'";
+    }
+    ofs << "],\n";
+
+    ofs << "      hovertemplate: '<b>%{text}</b><br>X=%{x:.4f}<br>Y=%{y:.4f}<br>Z=%{z:.4f}<extra></extra>',\n";
+    ofs << "      showlegend: false,\n";
+    ofs << "      marker: {\n";
+    ofs << "        size: 6,\n";
+    ofs << "        color: [";
+    for (size_t i = 0; i < node_colors.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << "'" << node_colors[i] << "'";
+    }
+    ofs << "],\n";
+    ofs << "        line: { color: 'rgb(80,80,80)', width: 1 }\n";
+    ofs << "      },\n";
+    ofs << "      name: 'body parts'\n";
+    ofs << "    };\n";
+
+    ofs << "    const dottedEdgeTrace = {\n";
+    ofs << "      type: 'scatter3d',\n";
+    ofs << "      mode: 'markers',\n";
+    ofs << "      x: [";
+    for (size_t i = 0; i < dotted_edge_points.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << dotted_edge_points[i][0];
+    }
+    ofs << "],\n";
+    ofs << "      y: [";
+    for (size_t i = 0; i < dotted_edge_points.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << dotted_edge_points[i][1];
+    }
+    ofs << "],\n";
+    ofs << "      z: [";
+    for (size_t i = 0; i < dotted_edge_points.size(); ++i) {
+        if (i > 0) ofs << ", ";
+        ofs << dotted_edge_points[i][2];
+    }
+    ofs << "],\n";
+    ofs << "      hoverinfo: 'skip',\n";
+    ofs << "      showlegend: false,\n";
+    ofs << "      marker: {\n";
+    ofs << "        size: 2.5,\n";
+    ofs << "        color: 'rgb(140,140,140)',\n";
+    ofs << "        opacity: 0.9\n";
+    ofs << "      },\n";
+    ofs << "      name: 'skeleton'\n";
+    ofs << "    };\n";
+
+    ofs << "    const data = [dottedEdgeTrace, nodeTrace];\n";
+    ofs << "    const layout = {\n";
+    ofs << "      title: 'Mouse Template Skeleton',\n";
+    ofs << "      scene: {\n";
+        ofs << "        xaxis: { title: 'X' },\n";
+        ofs << "        yaxis: { title: 'Y' },\n";
+        ofs << "        zaxis: { title: 'Z' },\n";
+        ofs << "        aspectmode: 'data',\n";
+        ofs << "        dragmode: 'turntable'\n";
+    ofs << "      }\n";
+    ofs << "    };\n";
+    ofs << "    Plotly.newPlot('plot', data, layout);\n";
+    ofs << "  </script>\n";
+    ofs << "</body>\n";
+    ofs << "</html>\n";
+
+    cout << "Saved interactive skeleton html to " << path << endl;
 }
 
 double compute_median(vector<double> values) {
@@ -372,11 +883,67 @@ double compute_median(vector<double> values) {
     return 0.5 * (values[mid - 1] + values[mid]);
 }
 
-unordered_map<string, vector<array<double, 3>>> collect_part_samples(
-    const map<long long, vector<Obs2>>& obs_by_frame,
-    const vector<cv::Mat>& Ps) {
+vector<array<double, 3>> filter_spatial_outliers(
+    const vector<array<double, 3>>& samples,
+    double outlier_thresh_mult) {
 
-    unordered_map<string, vector<array<double, 3>>> part_samples;
+    if (samples.size() < 4) {
+        return samples;
+    }
+
+    const array<double, 3> provisional_center = compute_coordinate_median_point(samples);
+    vector<double> distances;
+    distances.reserve(samples.size());
+    for (const auto& sample : samples) {
+        distances.push_back(euclidean_distance_3d(sample, provisional_center));
+    }
+
+    const double median_dist = compute_median(distances);
+    if (!std::isfinite(median_dist) || median_dist < 1e-9) {
+        return samples;
+    }
+
+    const double dist_thresh = outlier_thresh_mult * median_dist;
+    vector<array<double, 3>> filtered;
+    filtered.reserve(samples.size());
+    for (size_t i = 0; i < samples.size(); i++) {
+        if (distances[i] <= dist_thresh) {
+            filtered.push_back(samples[i]);
+        }
+    }
+
+    if (filtered.empty()) {
+        return samples;
+    }
+    return filtered;
+}
+
+SampleCollectionResult collect_part_samples(
+    const map<long long, vector<Obs2>>& obs_by_frame,
+    const vector<cv::Mat>& Ps,
+    const vector<string>& part_order,
+    double reproj_thresh_px,
+    double angle_thresh_deg,
+    int min_parts_for_frame_align) {
+
+    SampleCollectionResult result;
+    vector<cv::Point3d> camera_centers;
+    camera_centers.reserve(Ps.size());
+    for (const auto& P : Ps) {
+        camera_centers.push_back(camera_center_from_P(P));
+    }
+
+    size_t total_frames = obs_by_frame.size();
+    size_t frames_skipped_low_support = 0;
+    size_t frames_skipped_missing_head_center = 0;
+    size_t frames_skipped_missing_tail_root = 0;
+    size_t frames_skipped_missing_lr_reference = 0;
+    size_t frames_skipped_bad_alignment = 0;
+    size_t frames_accepted = 0;
+    size_t accepted_parts_accumulator = 0;
+    size_t lr_reference_ears = 0;
+    size_t lr_reference_front_paws = 0;
+    size_t lr_reference_hind_paws = 0;
 
     for (const auto& frame_entry : obs_by_frame) {
         unordered_map<string, vector<pair<int, cv::Point2d>>> part2views;
@@ -384,109 +951,167 @@ unordered_map<string, vector<array<double, 3>>> collect_part_samples(
             part2views[ob.part].push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
         }
 
+        unordered_map<string, array<double, 3>> frame_points_world;
+
         for (const auto& kv : part2views) {
             if (kv.second.size() < 2) {
                 continue;
             }
 
+            PartSampleStats& stats = result.stats[kv.first];
+            stats.raw_candidates++;
+
             cv::Point3d X = triangulate_DLT(kv.second, Ps);
             if (!std::isfinite(X.x) || !std::isfinite(X.y) || !std::isfinite(X.z)) {
+                stats.rejected_invalid++;
                 continue;
             }
 
-            part_samples[kv.first].push_back({X.x, X.y, X.z});
+            const double mean_reproj_error = reproj_error_px(X, kv.second, Ps);
+            if (!std::isfinite(mean_reproj_error) || mean_reproj_error > reproj_thresh_px) {
+                stats.rejected_reproj++;
+                continue;
+            }
+
+            const double max_angle_deg = max_triangulation_angle_deg(X, kv.second, camera_centers);
+            if (!std::isfinite(max_angle_deg) || max_angle_deg < angle_thresh_deg) {
+                stats.rejected_angle++;
+                continue;
+            }
+
+            frame_points_world[kv.first] = point3d_to_array(X);
         }
+
+        if (static_cast<int>(frame_points_world.size()) < min_parts_for_frame_align) {
+            frames_skipped_low_support++;
+            continue;
+        }
+
+        if (frame_points_world.find("head center") == frame_points_world.end()) {
+            frames_skipped_missing_head_center++;
+            continue;
+        }
+
+        if (frame_points_world.find("tail base") == frame_points_world.end()) {
+            frames_skipped_missing_tail_root++;
+            continue;
+        }
+
+        array<double, 3> left_right_vec = {0.0, 0.0, 0.0};
+        string lr_reference_source;
+        if (!get_left_right_reference(frame_points_world, left_right_vec, lr_reference_source)) {
+            frames_skipped_missing_lr_reference++;
+            continue;
+        }
+
+        array<double, 3> origin = {0.0, 0.0, 0.0};
+        array<double, 3> x_axis = {0.0, 0.0, 0.0};
+        array<double, 3> y_axis = {0.0, 0.0, 0.0};
+        array<double, 3> z_axis = {0.0, 0.0, 0.0};
+        if (!build_frame_alignment_axes(frame_points_world, left_right_vec,
+                                        origin, x_axis, y_axis, z_axis)) {
+            frames_skipped_bad_alignment++;
+            continue;
+        }
+
+        if (lr_reference_source == "ears") {
+            lr_reference_ears++;
+        } else if (lr_reference_source == "front paws") {
+            lr_reference_front_paws++;
+        } else if (lr_reference_source == "hind paws") {
+            lr_reference_hind_paws++;
+        }
+
+        for (const auto& kv : frame_points_world) {
+            const array<double, 3> X_local =
+                transform_world_to_local(kv.second, origin, x_axis, y_axis, z_axis);
+            result.part_samples[kv.first].push_back(X_local);
+            result.stats[kv.first].accepted++;
+        }
+
+        frames_accepted++;
+        accepted_parts_accumulator += frame_points_world.size();
     }
 
-    return part_samples;
+    cout << "Frame alignment stats:"
+         << " total_frames=" << total_frames
+         << ", skipped_low_support=" << frames_skipped_low_support
+         << ", skipped_missing_head_center=" << frames_skipped_missing_head_center
+         << ", skipped_missing_tail_root=" << frames_skipped_missing_tail_root
+         << ", skipped_missing_lr_reference=" << frames_skipped_missing_lr_reference
+         << ", skipped_bad_alignment=" << frames_skipped_bad_alignment
+         << ", accepted_frames=" << frames_accepted;
+    if (frames_accepted > 0) {
+        const double mean_parts =
+            static_cast<double>(accepted_parts_accumulator) / static_cast<double>(frames_accepted);
+        cout << ", mean_accepted_parts=" << mean_parts;
+    }
+    cout << endl;
+
+    cout << "Left-right reference usage:"
+         << " ears=" << lr_reference_ears
+         << ", front_paws=" << lr_reference_front_paws
+         << ", hind_paws=" << lr_reference_hind_paws << endl;
+
+    for (const string& part : part_order) {
+        const PartSampleStats stats = result.stats[part];
+        cout << "Part " << part
+             << ": raw=" << stats.raw_candidates
+             << ", rejected_invalid=" << stats.rejected_invalid
+             << ", rejected_reproj=" << stats.rejected_reproj
+             << ", rejected_angle=" << stats.rejected_angle
+             << ", accepted=" << stats.accepted << endl;
+    }
+
+    return result;
 }
 
-unordered_map<string, array<double, 3>> aggregate_model_world(
+unordered_map<string, array<double, 3>> aggregate_model_local(
     const unordered_map<string, vector<array<double, 3>>>& part_samples,
-    const vector<string>& part_order) {
+    const vector<string>& part_order,
+    double outlier_thresh_mult) {
 
-    unordered_map<string, array<double, 3>> model_world;
+    unordered_map<string, array<double, 3>> model_local;
 
     for (const string& part : part_order) {
         auto it = part_samples.find(part);
         if (it == part_samples.end() || it->second.empty()) {
-            cerr << "WARNING: No valid 3D samples collected for part " << part << endl;
+            cerr << "WARNING: No valid body-aligned local 3D samples collected for part " << part << endl;
             continue;
         }
 
-        vector<double> xs;
-        vector<double> ys;
-        vector<double> zs;
-        xs.reserve(it->second.size());
-        ys.reserve(it->second.size());
-        zs.reserve(it->second.size());
-
-        for (const auto& sample : it->second) {
-            xs.push_back(sample[0]);
-            ys.push_back(sample[1]);
-            zs.push_back(sample[2]);
+        const vector<array<double, 3>> filtered_samples =
+            filter_spatial_outliers(it->second, outlier_thresh_mult);
+        if (filtered_samples.empty()) {
+            cerr << "WARNING: All samples were filtered out for part " << part << endl;
+            continue;
         }
 
-        model_world[part] = {
-            compute_median(xs),
-            compute_median(ys),
-            compute_median(zs)
-        };
+        model_local[part] = compute_coordinate_median_point(filtered_samples);
 
-        cout << "Aggregated part " << part << " from " << it->second.size()
-             << " samples: ("
-             << model_world[part][0] << ", "
-             << model_world[part][1] << ", "
-             << model_world[part][2] << ")" << endl;
+        cout << "Aggregated part " << part
+             << " from " << it->second.size()
+             << " body-aligned local samples, kept " << filtered_samples.size()
+             << ": ("
+             << model_local[part][0] << ", "
+             << model_local[part][1] << ", "
+             << model_local[part][2] << ")" << endl;
     }
 
-    return model_world;
-}
-
-unordered_map<string, array<double, 3>> center_model(
-    const unordered_map<string, array<double, 3>>& model_world,
-    array<double, 3>& centroid_world) {
-
-    centroid_world = {0.0, 0.0, 0.0};
-    if (model_world.empty()) {
-        return {};
-    }
-
-    for (const auto& kv : model_world) {
-        centroid_world[0] += kv.second[0];
-        centroid_world[1] += kv.second[1];
-        centroid_world[2] += kv.second[2];
-    }
-
-    const double inv_count = 1.0 / static_cast<double>(model_world.size());
-    centroid_world[0] *= inv_count;
-    centroid_world[1] *= inv_count;
-    centroid_world[2] *= inv_count;
-
-    cout << "Template centroid in world coordinates: ("
-         << centroid_world[0] << ", "
-         << centroid_world[1] << ", "
-         << centroid_world[2] << ")" << endl;
-
-    unordered_map<string, array<double, 3>> model_obj;
-    for (const auto& kv : model_world) {
-        model_obj[kv.first] = {
-            kv.second[0] - centroid_world[0],
-            kv.second[1] - centroid_world[1],
-            kv.second[2] - centroid_world[2]
-        };
-    }
-
-    return model_obj;
+    return model_local;
 }
 
 int main(int argc, char** argv) {
-    string cams_path = "3cam_rigid/cams.txt";
-    string front_csv = "3cam_rigid/obs_de_front.csv";
-    string side_csv = "3cam_rigid/obs_de_side.csv";
-    string top_csv = "3cam_rigid/obs_de_top.csv";
+    string cams_path = "3cam/cams.txt";
+    string front_csv = "3cam/obs_de_front.csv";
+    string side_csv = "3cam/obs_de_side.csv";
+    string top_csv = "3cam/obs_de_top.csv";
     string output_path = "mouse_model_obj.csv";
     double fps = 30.0;
+    double reproj_thresh_px = 3.0;
+    double angle_thresh_deg = 5.0;
+    double outlier_thresh_mult = 3.0;
+    int min_parts_for_frame_align = 4;
 
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
@@ -502,15 +1127,27 @@ int main(int argc, char** argv) {
             output_path = argv[++i];
         } else if (arg == "--fps" && i + 1 < argc) {
             fps = stod(argv[++i]);
+        } else if (arg == "--reproj-thresh" && i + 1 < argc) {
+            reproj_thresh_px = stod(argv[++i]);
+        } else if (arg == "--angle-thresh" && i + 1 < argc) {
+            angle_thresh_deg = stod(argv[++i]);
+        } else if (arg == "--outlier-mult" && i + 1 < argc) {
+            outlier_thresh_mult = stod(argv[++i]);
+        } else if (arg == "--min-parts-frame" && i + 1 < argc) {
+            min_parts_for_frame_align = stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             cout << "Usage: " << argv[0] << " [options]\n";
             cout << "Options:\n";
-            cout << "  --cams <path>       Camera file path (default: 3cam_rigid/cams.txt)\n";
-            cout << "  --front <path>      Front camera CSV (default: 3cam_rigid/obs_de_front.csv)\n";
-            cout << "  --side <path>       Side camera CSV (default: 3cam_rigid/obs_de_side.csv)\n";
-            cout << "  --top <path>        Top camera CSV (default: 3cam_rigid/obs_de_top.csv)\n";
+            cout << "  --cams <path>       Camera file path (default: 3cam/cams.txt)\n";
+            cout << "  --front <path>      Front camera CSV (default: 3cam/obs_de_front.csv)\n";
+            cout << "  --side <path>       Side camera CSV (default: 3cam/obs_de_side.csv)\n";
+            cout << "  --top <path>        Top camera CSV (default: 3cam/obs_de_top.csv)\n";
             cout << "  --output <path>     Output template CSV (default: mouse_model_obj.csv)\n";
             cout << "  --fps <value>       Frame rate (default: 30.0)\n";
+            cout << "  --reproj-thresh <value>   Mean reprojection threshold in px (default: 3.0)\n";
+            cout << "  --angle-thresh <value>    Minimum triangulation angle in deg (default: 5.0)\n";
+            cout << "  --outlier-mult <value>    Spatial outlier distance multiplier (default: 3.0)\n";
+            cout << "  --min-parts-frame <value> Minimum accepted parts per frame for body-frame alignment (default: 4)\n";
             cout << "  --help, -h          Show this help\n";
             return 0;
         }
@@ -529,6 +1166,12 @@ int main(int argc, char** argv) {
     cout << "Resolved side CSV: " << side_csv << endl;
     cout << "Resolved top CSV: " << top_csv << endl;
     cout << "Output template CSV: " << output_path << endl;
+    cout << "Output skeleton PLY: " << replace_extension(output_path, ".ply") << endl;
+    cout << "Output skeleton HTML: " << replace_extension(output_path, ".html") << endl;
+    cout << "Reprojection threshold (px): " << reproj_thresh_px << endl;
+    cout << "Triangulation angle threshold (deg): " << angle_thresh_deg << endl;
+    cout << "Spatial outlier threshold multiplier: " << outlier_thresh_mult << endl;
+    cout << "Minimum accepted parts per frame: " << min_parts_for_frame_align << endl;
     cout << endl;
 
     cout << "Step 1: Loading data..." << endl;
@@ -554,33 +1197,29 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    cout << "\nStep 2: Collecting triangulated samples across frames..." << endl;
-    unordered_map<string, vector<array<double, 3>>> part_samples =
-        collect_part_samples(obs_by_frame, Ps);
-    for (const string& part : part_order) {
-        size_t sample_count = 0;
-        auto it = part_samples.find(part);
-        if (it != part_samples.end()) {
-            sample_count = it->second.size();
-        }
-        cout << "Part " << part << ": " << sample_count << " triangulated samples" << endl;
-    }
+    cout << "\nStep 2: Collecting head-centered, body-axis aligned local samples across frames..." << endl;
+    SampleCollectionResult collection =
+        collect_part_samples(obs_by_frame, Ps, part_order,
+                             reproj_thresh_px, angle_thresh_deg,
+                             min_parts_for_frame_align);
 
-    cout << "\nStep 3: Aggregating per-part samples with coordinate-wise medians..." << endl;
-    unordered_map<string, array<double, 3>> model_world =
-        aggregate_model_world(part_samples, part_order);
-    if (model_world.empty()) {
-        cerr << "ERROR: Failed to build a world-space template" << endl;
+    cout << "\nStep 3: Aggregating per-part body-aligned local samples with coordinate-wise medians..." << endl;
+    unordered_map<string, array<double, 3>> model_local =
+        aggregate_model_local(collection.part_samples, part_order, outlier_thresh_mult);
+    if (model_local.empty()) {
+        cerr << "ERROR: Failed to build a body-aligned local template" << endl;
         return -1;
     }
 
-    cout << "\nStep 4: Centering the template at its centroid..." << endl;
-    array<double, 3> centroid_world = {0.0, 0.0, 0.0};
-    unordered_map<string, array<double, 3>> model_obj =
-        center_model(model_world, centroid_world);
+    cout << "\nStep 4: Final template cleanup..." << endl;
+    unordered_map<string, array<double, 3>> model_obj = model_local;
+    cout << "This template is head-centered and body-axis aligned" << endl;
+    cout << "No final centroid recenter applied" << endl;
 
     cout << "\nStep 5: Saving template..." << endl;
-    save_template(output_path, model_obj);
+    save_template(output_path, model_obj, part_order);
+    save_template_point_cloud_ply(replace_extension(output_path, ".ply"), model_obj, part_order);
+    save_template_skeleton_html(replace_extension(output_path, ".html"), model_obj, part_order);
 
     cout << "\n=== All done! ===" << endl;
     cout << "Generated template with " << model_obj.size() << " parts" << endl;
