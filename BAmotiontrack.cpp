@@ -662,8 +662,10 @@ void cubic_spline_predict_center(const T* p_m2, const T* p_m1,
 // Motion-track grid constraint with a five-frame stencil.
 struct MotionTrackGridCost {
     MotionTrackGridCost(double weight, double grid_step,
-                        const array<double, 3>& grid_center_obj)
-        : weight_(weight), grid_step_(grid_step), grid_center_obj_(grid_center_obj) {}
+                        const array<double, 3>& grid_center_obj,
+                        double body_scale)
+        : weight_(weight), grid_step_(grid_step), grid_center_obj_(grid_center_obj),
+          body_scale_(body_scale > 1e-12 ? body_scale : 1.0) {}
 
     template <typename T>
     bool operator()(const T* const pose_m2, const T* const pose_m1,
@@ -701,10 +703,10 @@ struct MotionTrackGridCost {
                     X_pred[1] += pose_spline[4];
                     X_pred[2] += pose_spline[5];
 
-                    // Residual in 3D space.
-                    residuals[idx++] = T(weight_) * (X_actual[0] - X_pred[0]);
-                    residuals[idx++] = T(weight_) * (X_actual[1] - X_pred[1]);
-                    residuals[idx++] = T(weight_) * (X_actual[2] - X_pred[2]);
+                    // Residual in 3D space, normalized by body_scale_.
+                    residuals[idx++] = T(weight_) * (X_actual[0] - X_pred[0]) / T(body_scale_);
+                    residuals[idx++] = T(weight_) * (X_actual[1] - X_pred[1]) / T(body_scale_);
+                    residuals[idx++] = T(weight_) * (X_actual[2] - X_pred[2]) / T(body_scale_);
                 }
             }
         }
@@ -713,15 +715,17 @@ struct MotionTrackGridCost {
     }
 
     static ceres::CostFunction* Create(double weight, double grid_step,
-                                       const array<double, 3>& grid_center_obj) {
+                                       const array<double, 3>& grid_center_obj,
+                                       double body_scale) {
         return new ceres::AutoDiffCostFunction<MotionTrackGridCost, 81, 6, 6, 6, 6, 6>(
-            new MotionTrackGridCost(weight, grid_step, grid_center_obj));
+            new MotionTrackGridCost(weight, grid_step, grid_center_obj, body_scale));
     }
 
 private:
     double weight_;
     double grid_step_;
     array<double, 3> grid_center_obj_;
+    double body_scale_;
 };
 
 // ============================================================================
@@ -784,7 +788,8 @@ void global_bundle_adjustment(
     bool use_motion_track,
     double lambda,
     double grid_step,
-    const array<double, 3>& motion_track_center_obj) {
+    const array<double, 3>& motion_track_center_obj,
+    double body_scale) {
 
     ceres::Problem prob;
     ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
@@ -812,7 +817,7 @@ void global_bundle_adjustment(
 
         for (size_t i = 2; i < frame_numbers.size() - 2; i++) {
             ceres::CostFunction* cost =
-                MotionTrackGridCost::Create(weight, grid_step, motion_track_center_obj);
+                MotionTrackGridCost::Create(weight, grid_step, motion_track_center_obj, body_scale);
 
             prob.AddResidualBlock(cost, nullptr,
                 poses[i-2].data(),
@@ -1545,6 +1550,14 @@ int main(int argc, char** argv) {
         cerr << "WARNING: Template check: tail base -> tail root distance is unavailable." << endl;
     }
 
+    double motion_track_body_scale = head_to_tail_base;
+    if (motion_track_body_scale <= 0.0) {
+        cerr << "ERROR: Cannot derive a valid body scale from template (head center -> tail base)" << endl;
+        return -1;
+    }
+    cout << "Motion-track body scale for residual normalization: "
+         << motion_track_body_scale << endl;
+
     array<double, 3> initial_translation_world = {0.0, 0.0, 0.0};
     long long seed_frame = -1;
     if (!estimate_initial_translation_from_sequence(obs_by_frame, model_obj, Ps,
@@ -1604,7 +1617,7 @@ int main(int argc, char** argv) {
     }
 
     vector<string> generated_files;
-    
+
     // 3) Prepare the initial poses for global BA.
     cout << "\nStep 3: Preparing initial poses..." << endl;
 
@@ -1676,7 +1689,8 @@ int main(int argc, char** argv) {
     cout << "\nStep 4: Global bundle adjustment..." << endl;
 
     global_bundle_adjustment(obs_by_frame, model_obj, Ps, poses, frame_numbers,
-                            use_motion_track, lambda, grid_step, motion_track_center_obj);
+                            use_motion_track, lambda, grid_step, motion_track_center_obj,
+                            motion_track_body_scale);
 
 
     // Report the largest pose change introduced by global BA.
