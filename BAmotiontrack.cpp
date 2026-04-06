@@ -466,47 +466,109 @@ unordered_map<string, array<double, 3>> load_template(const string& path) {
     return model_obj;
 }
 
-array<double, 3> estimate_initial_translation_from_frame(
-    const vector<Obs2>& obs_frame,
+double distance_3d(const array<double, 3>& a,
+                   const array<double, 3>& b) {
+    const double dx = a[0] - b[0];
+    const double dy = a[1] - b[1];
+    const double dz = a[2] - b[2];
+    return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+bool estimate_initial_translation_from_sequence(
+    const map<long long, vector<Obs2>>& obs_by_frame,
     const unordered_map<string, array<double, 3>>& model_obj,
-    const vector<cv::Mat>& Ps) {
+    const vector<cv::Mat>& Ps,
+    array<double, 3>& translation_seed_world, long long& seed_frame) {
 
-    unordered_map<string, vector<pair<int, cv::Point2d>>> part2views;
-    for (const auto& ob : obs_frame) {
-        if (!model_obj.count(ob.part)) {
+    if (obs_by_frame.empty()) {
+        cerr << "ERROR: No frames are available for initial translation estimation" << endl;
+        return false;
+    }
+
+    if (!model_obj.count("head center")) {
+        cerr << "ERROR: Template does not contain 'head center'; cannot estimate the initial translation seed" << endl;
+        return false;
+    }
+
+    for (const auto& kv : obs_by_frame) {
+        const long long fr = kv.first;
+        const vector<Obs2>& obs_frame = kv.second;
+
+        vector<pair<int, cv::Point2d>> head_center_views;
+        for (const auto& ob : obs_frame) {
+            if (ob.part == "head center") {
+                head_center_views.push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
+            }
+        }
+
+        if (head_center_views.size() < 2) {
             continue;
         }
-        part2views[ob.part].push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
-    }
 
-    array<double, 3> center_world = {0.0, 0.0, 0.0};
-    int count = 0;
-    for (const auto& kv : part2views) {
-        if (kv.second.size() < 2) {
+        cv::Point3d X_hc = triangulate_DLT(head_center_views, Ps);
+        if (!std::isfinite(X_hc.x) || !std::isfinite(X_hc.y) || !std::isfinite(X_hc.z)) {
             continue;
         }
 
-        cv::Point3d X = triangulate_DLT(kv.second, Ps);
-        center_world[0] += X.x;
-        center_world[1] += X.y;
-        center_world[2] += X.z;
-        count++;
+        translation_seed_world = {X_hc.x, X_hc.y, X_hc.z};
+        seed_frame = fr;
+        cout << "Initial translation seed fixed from head center at frame "
+             << seed_frame << ": ("
+             << translation_seed_world[0] << ", "
+             << translation_seed_world[1] << ", "
+             << translation_seed_world[2] << ")" << endl;
+        return true;
     }
 
-    if (count == 0) {
-        cerr << "WARNING: Could not estimate an initial translation from the first frame; using zero translation seed" << endl;
-        return {0.0, 0.0, 0.0};
+    cerr << "ERROR: Could not find any frame with a valid triangulatable 'head center' (requires >=2 views)" << endl;
+    return false;
+}
+
+array<double, 3> compute_template_centroid_obj(
+    const unordered_map<string, array<double, 3>>& model_obj) {
+
+    array<double, 3> centroid = {0.0, 0.0, 0.0};
+    if (model_obj.empty()) {
+        return centroid;
     }
 
-    const double inv_count = 1.0 / static_cast<double>(count);
-    center_world[0] *= inv_count;
-    center_world[1] *= inv_count;
-    center_world[2] *= inv_count;
+    for (const auto& kv : model_obj) {
+        centroid[0] += kv.second[0];
+        centroid[1] += kv.second[1];
+        centroid[2] += kv.second[2];
+    }
 
-    cout << "Initial translation seed estimated from the first frame centroid: ("
-         << center_world[0] << ", " << center_world[1] << ", " << center_world[2]
-         << ")" << endl;
-    return center_world;
+    const double inv_count = 1.0 / static_cast<double>(model_obj.size());
+    centroid[0] *= inv_count;
+    centroid[1] *= inv_count;
+    centroid[2] *= inv_count;
+    return centroid;
+}
+
+bool compute_template_body_scale_stats(
+    const unordered_map<string, array<double, 3>>& model_obj,
+    double& head_to_tail_base,
+    double& tail_base_to_tail_root) {
+
+    head_to_tail_base = -1.0;
+    tail_base_to_tail_root = -1.0;
+    bool has_any_stat = false;
+
+    auto head_center_it = model_obj.find("head center");
+    auto tail_root_it = model_obj.find("tail root");
+    auto tail_base_it = model_obj.find("tail base");
+
+    if (head_center_it != model_obj.end() && tail_base_it != model_obj.end()) {
+        head_to_tail_base = distance_3d(head_center_it->second, tail_base_it->second);
+        has_any_stat = true;
+    }
+
+    if (tail_root_it != model_obj.end() && tail_base_it != model_obj.end()) {
+        tail_base_to_tail_root = distance_3d(tail_base_it->second,tail_root_it->second);
+        has_any_stat = true;
+    }
+
+    return has_any_stat;
 }
 
 // ============================================================================
@@ -515,10 +577,10 @@ array<double, 3> estimate_initial_translation_from_frame(
 
 // Reprojection residual for one observation with a fixed template point.
 struct PoseReprojCost {
-    PoseReprojCost(const cv::Mat& P, const array<double, 3>& X_obj, 
+    PoseReprojCost(const cv::Mat& P, const array<double, 3>& X_obj,
                    double u_obs, double v_obs)
         : P_(P), X_obj_(X_obj), u_obs_(u_obs), v_obs_(v_obs) {}
-    
+
     template <typename T>
     bool operator()(const T* const pose, T* residuals) const {
         // pose = [angle_axis(3), translation(3)]
@@ -530,7 +592,7 @@ struct PoseReprojCost {
         X_obj[0] = T(X_obj_[0]);
         X_obj[1] = T(X_obj_[1]);
         X_obj[2] = T(X_obj_[2]);
-        
+
         // Apply rotation.
         T X_world[3];
         ceres::AngleAxisRotatePoint(aa, X_obj, X_world);
@@ -542,32 +604,32 @@ struct PoseReprojCost {
 
         // Project to the image plane.
         T X_homo[4] = {X_world[0], X_world[1], X_world[2], T(1.0)};
-        
+
         T u_pred = T(0.0), v_pred = T(0.0), w_pred = T(0.0);
-        
+
         for (int j = 0; j < 4; j++) {
             u_pred += T(P_.at<double>(0, j)) * X_homo[j];
             v_pred += T(P_.at<double>(1, j)) * X_homo[j];
             w_pred += T(P_.at<double>(2, j)) * X_homo[j];
         }
-        
+
         u_pred /= w_pred;
         v_pred /= w_pred;
-        
+
         // Residual in image space.
         residuals[0] = u_pred - T(u_obs_);
         residuals[1] = v_pred - T(v_obs_);
-        
+
         return true;
     }
-    
-    static ceres::CostFunction* Create(const cv::Mat& P, 
+
+    static ceres::CostFunction* Create(const cv::Mat& P,
                                        const array<double, 3>& X_obj,
                                        double u, double v) {
         return new ceres::AutoDiffCostFunction<PoseReprojCost, 2, 6>(
             new PoseReprojCost(P, X_obj, u, v));
     }
-    
+
 private:
     cv::Mat P_;
     array<double, 3> X_obj_;
@@ -577,7 +639,7 @@ private:
 // Four-point cubic interpolation used to predict the center frame from
 // t-2, t-1, t+1, and t+2.
 template <typename T>
-void cubic_spline_predict_center(const T* p_m2, const T* p_m1, 
+void cubic_spline_predict_center(const T* p_m2, const T* p_m1,
                                   const T* p_p1, const T* p_p2,
                                   T* result, int dim) {
     // The sample times are fixed at -2, -1, +1, +2 relative to the center
@@ -586,12 +648,12 @@ void cubic_spline_predict_center(const T* p_m2, const T* p_m1,
     // l1(0) = (0-(-2))*(0-1)*(0-2) / ((-1)-(-2))*((-1)-1)*((-1)-2) = 2*(-1)*(-2)/(1*(-2)*(-3)) = 4/6 = 2/3
     // l2(0) = (0-(-2))*(0-(-1))*(0-2) / (1-(-2))*(1-(-1))*(1-2) = 2*1*(-2)/(3*2*(-1)) = -4/(-6) = 2/3
     // l3(0) = (0-(-2))*(0-(-1))*(0-1) / (2-(-2))*(2-(-1))*(2-1) = 2*1*(-1)/(4*3*1) = -2/12 = -1/6
-    
+
     T w0 = T(-1.0/6.0);
     T w1 = T(2.0/3.0);
     T w2 = T(2.0/3.0);
     T w3 = T(-1.0/6.0);
-    
+
     for (int i = 0; i < dim; i++) {
         result[i] = w0 * p_m2[i] + w1 * p_m1[i] + w2 * p_p1[i] + w3 * p_p2[i];
     }
@@ -599,19 +661,20 @@ void cubic_spline_predict_center(const T* p_m2, const T* p_m1,
 
 // Motion-track grid constraint with a five-frame stencil.
 struct MotionTrackGridCost {
-    MotionTrackGridCost(double weight, double grid_step)
-        : weight_(weight), grid_step_(grid_step) {}
-    
+    MotionTrackGridCost(double weight, double grid_step,
+                        const array<double, 3>& grid_center_obj)
+        : weight_(weight), grid_step_(grid_step), grid_center_obj_(grid_center_obj) {}
+
     template <typename T>
     bool operator()(const T* const pose_m2, const T* const pose_m1,
                     const T* const pose_0, const T* const pose_p1,
                     const T* const pose_p2, T* residuals) const {
-        
+
         // Predict the center pose from its four neighbors without using pose_0.
         T pose_spline[6];
-        cubic_spline_predict_center(pose_m2, pose_m1, pose_p1, pose_p2, 
+        cubic_spline_predict_center(pose_m2, pose_m1, pose_p1, pose_p2,
                                      pose_spline, 6);
-        
+
         // Compare the actual pose and the predicted pose on a 3x3x3 grid.
         int idx = 0;
         for (int ix = -1; ix <= 1; ix++) {
@@ -619,25 +682,25 @@ struct MotionTrackGridCost {
                 for (int iz = -1; iz <= 1; iz++) {
                     // Grid point in the object frame.
                     T grid_pt[3] = {
-                        T(ix * grid_step_),
-                        T(iy * grid_step_),
-                        T(iz * grid_step_)
+                        T(grid_center_obj_[0] + ix * grid_step_),
+                        T(grid_center_obj_[1] + iy * grid_step_),
+                        T(grid_center_obj_[2] + iz * grid_step_)
                     };
-                    
+
                     // Transform with the actual center-frame pose.
                     T X_actual[3];
                     ceres::AngleAxisRotatePoint(pose_0, grid_pt, X_actual);
                     X_actual[0] += pose_0[3];
                     X_actual[1] += pose_0[4];
                     X_actual[2] += pose_0[5];
-                    
+
                     // Transform with the spline-predicted pose.
                     T X_pred[3];
                     ceres::AngleAxisRotatePoint(pose_spline, grid_pt, X_pred);
                     X_pred[0] += pose_spline[3];
                     X_pred[1] += pose_spline[4];
                     X_pred[2] += pose_spline[5];
-                    
+
                     // Residual in 3D space.
                     residuals[idx++] = T(weight_) * (X_actual[0] - X_pred[0]);
                     residuals[idx++] = T(weight_) * (X_actual[1] - X_pred[1]);
@@ -645,18 +708,20 @@ struct MotionTrackGridCost {
                 }
             }
         }
-        
+
         return true;
     }
-    
-    static ceres::CostFunction* Create(double weight, double grid_step) {
+
+    static ceres::CostFunction* Create(double weight, double grid_step,
+                                       const array<double, 3>& grid_center_obj) {
         return new ceres::AutoDiffCostFunction<MotionTrackGridCost, 81, 6, 6, 6, 6, 6>(
-            new MotionTrackGridCost(weight, grid_step));
+            new MotionTrackGridCost(weight, grid_step, grid_center_obj));
     }
-    
+
 private:
     double weight_;
     double grid_step_;
+    array<double, 3> grid_center_obj_;
 };
 
 // ============================================================================
@@ -677,31 +742,31 @@ void initialize_pose_per_frame(
             part_count[ob.part]++;
         }
     }
-    
+
     if (part_count.size() < 3) {
         // Keep the current seed if the frame is too sparse.
         return;
     }
-    
+
     ceres::Problem prob;
     ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
-    
+
     for (const auto& ob : obs_frame) {
         if (!model_obj.count(ob.part)) continue;
-        
+
         const auto& X_obj = model_obj.at(ob.part);
-        
+
         ceres::CostFunction* cost = PoseReprojCost::Create(
             Ps[ob.cam], X_obj, ob.u, ob.v);
-        
+
         prob.AddResidualBlock(cost, loss, pose_init);
     }
-    
+
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
     options.max_num_iterations = 5; // Short local refinement for warm start.
     options.minimizer_progress_to_stdout = false;
-    
+
     ceres::Solver::Summary summary;
     ceres::Solve(options, &prob, &summary);
 }
@@ -718,35 +783,37 @@ void global_bundle_adjustment(
     vector<long long>& frame_numbers,
     bool use_motion_track,
     double lambda,
-    double grid_step) {
-    
+    double grid_step,
+    const array<double, 3>& motion_track_center_obj) {
+
     ceres::Problem prob;
     ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
-    
+
     // 4.1 Add all reprojection residuals.
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
         const auto& obs_frame = obs_by_frame[fr];
-        
+
         for (const auto& ob : obs_frame) {
             if (!model_obj.count(ob.part)) continue;
-            
+
             const auto& X_obj = model_obj.at(ob.part);
-            
+
             ceres::CostFunction* cost = PoseReprojCost::Create(
                 Ps[ob.cam], X_obj, ob.u, ob.v);
-            
+
             prob.AddResidualBlock(cost, loss, poses[i].data());
         }
     }
-    
+
     // 4.2 Add motion-track constraints.
     if (use_motion_track && frame_numbers.size() >= 5) {
         double weight = sqrt(lambda);
-        
+
         for (size_t i = 2; i < frame_numbers.size() - 2; i++) {
-            ceres::CostFunction* cost = MotionTrackGridCost::Create(weight, grid_step);
-            
+            ceres::CostFunction* cost =
+                MotionTrackGridCost::Create(weight, grid_step, motion_track_center_obj);
+
             prob.AddResidualBlock(cost, nullptr,
                 poses[i-2].data(),
                 poses[i-1].data(),
@@ -754,20 +821,24 @@ void global_bundle_adjustment(
                 poses[i+1].data(),
                 poses[i+2].data());
         }
-        
-        cout << "Added " << (frame_numbers.size() - 4) << " motion-track constraints" << endl;
+
+        cout << "Added " << (frame_numbers.size() - 4)
+             << " motion-track constraints centered at object point ("
+             << motion_track_center_obj[0] << ", "
+             << motion_track_center_obj[1] << ", "
+             << motion_track_center_obj[2] << ")" << endl;
     }
-    
+
     // 4.3 Solve the joint problem.
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;  // Sparse solver for the global problem.
-    options.max_num_iterations = 100;
+    options.max_num_iterations = 200;
     options.minimizer_progress_to_stdout = true;
     options.num_threads = 4;  // Use multithreading where available.
-    
+
     ceres::Solver::Summary summary;
     ceres::Solve(options, &prob, &summary);
-    
+
     cout << summary.BriefReport() << endl;
 }
 
@@ -776,7 +847,7 @@ void global_bundle_adjustment(
 // ============================================================================
 
 // Apply a pose transform to a 3D point.
-void apply_pose_transform(const array<double, 6>& pose, 
+void apply_pose_transform(const array<double, 6>& pose,
                           const array<double, 3>& X_obj,
                           array<double, 3>& X_world) {
     double X_rot[3];
@@ -790,16 +861,16 @@ void apply_pose_transform(const array<double, 6>& pose,
 bool project_point(const cv::Mat& P, const array<double, 3>& X_world,
                    double& u, double& v) {
     double X_homo[4] = {X_world[0], X_world[1], X_world[2], 1.0};
-    
+
     double u_h = 0, v_h = 0, w = 0;
     for (int j = 0; j < 4; j++) {
         u_h += P.at<double>(0, j) * X_homo[j];
         v_h += P.at<double>(1, j) * X_homo[j];
         w += P.at<double>(2, j) * X_homo[j];
     }
-    
+
     if (fabs(w) < 1e-10) return false;
-    
+
     u = u_h / w;
     v = v_h / w;
     return true;
@@ -850,7 +921,8 @@ TrackErrorStats compute_track_error_for_frame(
     const array<double, 6>& pose_0,
     const array<double, 6>& pose_p1,
     const array<double, 6>& pose_p2,
-    double grid_step) {
+    double grid_step,
+    const array<double, 3>& grid_center_obj) {
 
     // Predict the center pose from neighboring frames.
     double pose_spline[6];
@@ -865,9 +937,9 @@ TrackErrorStats compute_track_error_for_frame(
         for (int iy = -1; iy <= 1; iy++) {
             for (int iz = -1; iz <= 1; iz++) {
                 array<double, 3> grid_pt = {
-                    ix * grid_step,
-                    iy * grid_step,
-                    iz * grid_step
+                    grid_center_obj[0] + ix * grid_step,
+                    grid_center_obj[1] + iy * grid_step,
+                    grid_center_obj[2] + iz * grid_step
                 };
 
                 // Transform with the optimized center-frame pose.
@@ -1119,6 +1191,7 @@ void save_track_frame_errors(
     const string& path,
     const vector<long long>& frame_numbers,
     const vector<array<double, 6>>& poses,
+    const array<double, 3>& grid_center_obj,
     double grid_step,
     double fps,
     bool use_motion_track) {
@@ -1143,14 +1216,14 @@ void save_track_frame_errors(
 
         TrackErrorStats stats = compute_track_error_for_frame(
             poses[i-2], poses[i-1], poses[i], poses[i+1], poses[i+2],
-            grid_step);
+            grid_step, grid_center_obj);
 
         ofs << fr << "," << t << ","
             << stats.rmse << ","
             << stats.mean_abs << ","
             << stats.max_abs << "\n";
     }
-    
+
     cout << "Saved motion-track errors (per frame) to " << path << endl;
 }
 
@@ -1167,9 +1240,9 @@ void save_poses(const string& path,
         cerr << "ERROR: Cannot write " << path << endl;
         return;
     }
-    
+
     ofs << "frame,t,rx,ry,rz,tx,ty,tz\n";
-    
+
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
         double t = fr / fps;
@@ -1177,7 +1250,7 @@ void save_poses(const string& path,
             << poses[i][0] << "," << poses[i][1] << "," << poses[i][2] << ","
             << poses[i][3] << "," << poses[i][4] << "," << poses[i][5] << "\n";
     }
-    
+
     cout << "Saved poses to " << path << endl;
 }
 
@@ -1192,14 +1265,14 @@ void save_3d_points(const string& path,
         cerr << "ERROR: Cannot write " << path << endl;
         return;
     }
-    
+
     ofs << "frame,t,part,X,Y,Z\n";
-    
+
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
         double t = fr / fps;
         const auto& pose = poses[i];
-        
+
         // Follow part_order to preserve the original CSV order.
         for (const string& part : part_order) {
             // Skip parts that were never added to the template.
@@ -1207,9 +1280,9 @@ void save_3d_points(const string& path,
             if (it == model_obj.end()) {
                 continue; // Part not present in the template.
             }
-            
+
             const auto& X_obj = it->second;
-            
+
             // Apply rotation.
             double X_rot[3];
             ceres::AngleAxisRotatePoint(pose.data(), X_obj.data(), X_rot);
@@ -1220,12 +1293,12 @@ void save_3d_points(const string& path,
                 X_rot[1] + pose[4],
                 X_rot[2] + pose[5]
             };
-            
+
             ofs << fr << "," << t << "," << part << ","
                 << X_world[0] << "," << X_world[1] << "," << X_world[2] << "\n";
         }
     }
-    
+
     cout << "Saved 3D points to " << path << " (order preserved)" << endl;
 }
 
@@ -1302,12 +1375,15 @@ void save_restored_3d_points(
 
 int main(int argc, char** argv) {
     // Default inputs. Override them with command-line arguments if needed.
-    string cams_path = "3cam_rigid/cams.txt";
-    string front_csv = "3cam_rigid/obs_de_front.csv";
-    string side_csv = "3cam_rigid/obs_de_side.csv";
-    string top_csv = "3cam_rigid/obs_de_top.csv";
+    string cams_path = "3cam/cams.txt";
+    string front_csv = "3cam/obs_de_front.csv";
+    string side_csv = "3cam/obs_de_side.csv";
+    string top_csv = "3cam/obs_de_top.csv";
     string template_path = "mouse_model_obj.csv";
-    
+    string output_dir = "results";
+    string mt_center_part = "";
+    bool mt_center_part_specified = false;
+
     double fps = 30.0;
     bool use_warm_start = false;
     bool use_motion_track = false;   // Motion-track is off unless explicitly enabled.
@@ -1316,7 +1392,7 @@ int main(int argc, char** argv) {
     double lambda = 1.0;             // Motion-track weight.
     double grid_step = 10.0;         // Virtual grid spacing in mm.
     int frame_stride = 1;            // 1 = use every frame, 2 = use every other frame, etc.
-    
+
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
@@ -1334,7 +1410,7 @@ int main(int argc, char** argv) {
             save_reproj = true;
         } else if (arg == "--lambda" && i+1 < argc) {
             lambda = stod(argv[++i]);
-        } else if (arg == "--grid-step" && i+1 < argc) {
+        } else if ((arg == "--grid-step" || arg == "--grid_step") && i+1 < argc) {
             grid_step = stod(argv[++i]);
         } else if (arg == "--stride" && i+1 < argc) {
             frame_stride = stoi(argv[++i]);
@@ -1348,23 +1424,31 @@ int main(int argc, char** argv) {
             top_csv = argv[++i];
         } else if (arg == "--template" && i+1 < argc) {
             template_path = argv[++i];
+        } else if ((arg == "--mt-center" || arg == "--mt-center-part") && i+1 < argc) {
+            mt_center_part = argv[++i];
+            mt_center_part_specified = true;
+        } else if (arg == "--outdir" && i+1 < argc) {
+            output_dir = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             cout << "Usage: " << argv[0] << " [options]\n";
             cout << "Options:\n";
-            cout << "  --cams <path>       Camera file path (default: 3cam_rigid/cams.txt)\n";
-            cout << "  --front <path>      Front camera CSV (default: 3cam_rigid/obs_de_front.csv)\n";
-            cout << "  --side <path>       Side camera CSV (default: 3cam_rigid/obs_de_side.csv)\n";
-            cout << "  --top <path>        Top camera CSV (default: 3cam_rigid/obs_de_top.csv)\n";
+            cout << "  --cams <path>       Camera file path (default: 3cam/cams.txt)\n";
+            cout << "  --front <path>      Front camera CSV (default: 3cam/obs_de_front.csv)\n";
+            cout << "  --side <path>       Side camera CSV (default: 3cam/obs_de_side.csv)\n";
+            cout << "  --top <path>        Top camera CSV (default: 3cam/obs_de_top.csv)\n";
             cout << "  --template <path>   Rigid template CSV (default: mouse_model_obj.csv)\n";
             cout << "  --fps <value>       Frame rate (default: 30.0)\n";
             cout << "  --warm-start        Enable per-frame pose warm start\n";
             cout << "  --motion-track      Enable motion-track constraint\n";
             cout << "  --no-motion-track   Disable motion-track constraint\n";
-            cout << "  --save-init         Save warm-start pose/xyz analysis under results/debug/\n";
-            cout << "  --save-reproj       Save final reprojection diagnostics under results/debug/\n";
+            cout << "  --save-init         Save init and optional warm-start pose/xyz analysis under <outdir>/debug/\n";
+            cout << "  --save-reproj       Save final reprojection diagnostics under <outdir>/debug/\n";
             cout << "  --lambda <value>    Motion-track weight (default: 1.0)\n";
             cout << "  --grid-step <value> Grid step in mm (default: 10.0)\n";
+            cout << "  --grid_step <value> Alias for --grid-step\n";
+            cout << "  --mt-center <part>  Use a template body part as the motion-track grid center\n";
             cout << "  --stride <value>    Frame stride, use every Nth frame (default: 1)\n";
+            cout << "  --outdir <path>     Output directory for evaluation and debug files (default: results)\n";
             cout << "  --help, -h          Show this help\n";
             return 0;
         }
@@ -1376,7 +1460,7 @@ int main(int argc, char** argv) {
     side_csv = resolve_input_path(side_csv, executable_dir);
     top_csv = resolve_input_path(top_csv, executable_dir);
     template_path = resolve_input_path(template_path, executable_dir);
-    
+
     cout << "\n=== BA Motion Track ===\n" << endl;
     cout << "FPS: " << fps << endl;
     cout << "Warm start: " << (use_warm_start ? "ON" : "OFF") << endl;
@@ -1391,12 +1475,9 @@ int main(int argc, char** argv) {
     cout << "Resolved side CSV: " << side_csv << endl;
     cout << "Resolved top CSV: " << top_csv << endl;
     cout << "Resolved template CSV: " << template_path << endl;
+    cout << "Output directory: " << output_dir << endl;
     cout << endl;
 
-    if (save_init && !use_warm_start) {
-        cout << "Note: --save-init was requested without --warm-start; warm-start outputs will be skipped" << endl;
-    }
-    
     // 1) Load input data.
     cout << "Step 1: Loading data..." << endl;
     vector<cv::Mat> Ps = load_Ps_txt_first3(cams_path);
@@ -1404,28 +1485,27 @@ int main(int argc, char** argv) {
         cerr << "ERROR: Need exactly 3 cameras" << endl;
         return -1;
     }
-    
+
     vector<Obs2> obs_front = load_obs_csv(front_csv, 0);
     vector<Obs2> obs_side = load_obs_csv(side_csv, 1);
     vector<Obs2> obs_top = load_obs_csv(top_csv, 2);
-    
+
     vector<Obs2> obsAll;
     obsAll.insert(obsAll.end(), obs_front.begin(), obs_front.end());
     obsAll.insert(obsAll.end(), obs_side.begin(), obs_side.end());
     obsAll.insert(obsAll.end(), obs_top.begin(), obs_top.end());
-    
+
     vector<string> part_order;  // Preserve the first-seen part order from the input CSVs.
     map<long long, vector<Obs2>> obs_by_frame = group_obs_by_frame(obsAll, fps, part_order);
-    
+
     if (obs_by_frame.empty()) {
         cerr << "ERROR: No observations found" << endl;
         return -1;
     }
-    
+
     // 2) Load the rigid template and estimate a translation seed.
     cout << "\nStep 2: Loading rigid template..." << endl;
-    long long t0 = obs_by_frame.begin()->first;
-    cout << "Initial frame for pose seeding: " << t0 << " (t=" << (t0/fps) << "s)" << endl;
+    cout << "Initial translation seed will be fixed from the first valid frame with triangulatable 'head center'" << endl;
 
     unordered_map<string, array<double, 3>> model_obj = load_template(template_path);
     if (model_obj.empty()) {
@@ -1433,16 +1513,92 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    array<double, 3> initial_translation_world =
-        estimate_initial_translation_from_frame(obs_by_frame[t0], model_obj, Ps);
+    const array<double, 3> template_centroid_obj = compute_template_centroid_obj(model_obj);
+    const auto head_center_it = model_obj.find("head center");
+    if (head_center_it != model_obj.end() &&
+        fabs(head_center_it->second[0]) < 1e-6 &&
+        fabs(head_center_it->second[1]) < 1e-6 &&
+        fabs(head_center_it->second[2]) < 1e-6) {
+        cout << "Template check: head center is at object origin (head-centered template)." << endl;
+    } else {
+        cerr << "WARNING: Template check: head center is not at object origin." << endl;
+    }
 
-    const string results_dir = "results";
+    cout << "Template centroid in object frame: ("
+         << template_centroid_obj[0] << ", "
+         << template_centroid_obj[1] << ", "
+         << template_centroid_obj[2] << ")" << endl;
+
+    double head_to_tail_base = -1.0;
+    double tail_base_to_tail_root = -1.0;
+    compute_template_body_scale_stats(model_obj, head_to_tail_base, tail_base_to_tail_root);
+    if (head_to_tail_base > 0.0) {
+        cout << "Template check: head center -> tail base distance = "
+             << head_to_tail_base << endl;
+    } else {
+        cerr << "WARNING: Template check: head center -> tail base distance is unavailable." << endl;
+    }
+    if (tail_base_to_tail_root > 0.0) {
+        cout << "Template check: tail base -> tail root distance = "
+             << tail_base_to_tail_root << endl;
+    } else {
+        cerr << "WARNING: Template check: tail base -> tail root distance is unavailable." << endl;
+    }
+
+    array<double, 3> initial_translation_world = {0.0, 0.0, 0.0};
+    long long seed_frame = -1;
+    if (!estimate_initial_translation_from_sequence(obs_by_frame, model_obj, Ps,
+                                                    initial_translation_world, seed_frame)) {
+        return -1;
+    }
+    cout << "Initial pose seed frame (confirmed): " << seed_frame << endl;
+
+    array<double, 3> motion_track_center_obj = template_centroid_obj;
+    if (mt_center_part_specified) {
+        auto mt_center_it = model_obj.find(mt_center_part);
+        if (mt_center_it == model_obj.end()) {
+            cerr << "ERROR: Motion-track center body part '" << mt_center_part
+                 << "' does not exist in the template" << endl;
+            return -1;
+        }
+        motion_track_center_obj = mt_center_it->second;
+        cout << "Motion-track grid center set from body part '" << mt_center_part << "': ("
+             << motion_track_center_obj[0] << ", "
+             << motion_track_center_obj[1] << ", "
+             << motion_track_center_obj[2] << ")" << endl;
+    } else {
+        cout << "Motion-track grid center set from template centroid: ("
+             << motion_track_center_obj[0] << ", "
+             << motion_track_center_obj[1] << ", "
+             << motion_track_center_obj[2] << ")" << endl;
+    }
+
+    cout << "Motion-track grid step: " << grid_step << endl;
+    cout << "Motion-track grid center: ("
+         << motion_track_center_obj[0] << ", "
+         << motion_track_center_obj[1] << ", "
+         << motion_track_center_obj[2] << ")" << endl;
+
+    if (grid_step <= 0.0) {
+        cerr << "ERROR: Motion-track grid_step must be positive" << endl;
+        return -1;
+    }
+    if (head_to_tail_base > 0.0) {
+        if (grid_step < 0.05 * head_to_tail_base) {
+            cerr << "WARNING: Motion-track grid_step is very small relative to body length; rotation sensitivity may be weak." << endl;
+        }
+        if (grid_step > 1.0 * head_to_tail_base) {
+            cerr << "WARNING: Motion-track grid_step is larger than the main body length; the MT grid may be too large." << endl;
+        }
+    }
+
+    const string results_dir = output_dir;
     const string debug_dir = join_path(results_dir, "debug");
     if (!ensure_directory(results_dir)) {
         return -1;
     }
 
-    const bool need_debug_dir = (use_warm_start && save_init) || save_reproj;
+    const bool need_debug_dir = save_init || save_reproj;
     if (need_debug_dir && !ensure_directory(debug_dir)) {
         return -1;
     }
@@ -1472,6 +1628,15 @@ int main(int argc, char** argv) {
         cout << "Using frame stride " << frame_stride
              << " (processing " << frame_numbers.size()
              << " out of " << obs_by_frame.size() << " frames)" << endl;
+    }
+
+    if (save_init) {
+        const string init_pose_path = join_path(debug_dir, "init_pose.csv");
+        const string init_xyz_path = join_path(debug_dir, "init_xyz.csv");
+        save_poses(init_pose_path, frame_numbers, poses, fps);
+        save_3d_points(init_xyz_path, frame_numbers, poses, model_obj, part_order, fps);
+        generated_files.push_back(init_pose_path);
+        generated_files.push_back(init_xyz_path);
     }
 
     if (use_warm_start) {
@@ -1511,7 +1676,7 @@ int main(int argc, char** argv) {
     cout << "\nStep 4: Global bundle adjustment..." << endl;
 
     global_bundle_adjustment(obs_by_frame, model_obj, Ps, poses, frame_numbers,
-                            use_motion_track, lambda, grid_step);
+                            use_motion_track, lambda, grid_step, motion_track_center_obj);
 
 
     // Report the largest pose change introduced by global BA.
@@ -1538,12 +1703,12 @@ int main(int argc, char** argv) {
     generated_files.push_back(pose_output_path);
     generated_files.push_back(xyz_output_path);
 
-    if (use_motion_track) {
-        const string restored_output_path = join_path(results_dir, "xyz_restored.csv");
-        save_restored_3d_points(restored_output_path, obs_by_frame, frame_numbers, poses,
-                                model_obj, part_order, fps, static_cast<int>(Ps.size()));
-        generated_files.push_back(restored_output_path);
-    }
+    const string restored_output_path = join_path(
+        results_dir,
+        use_motion_track ? "xyz_restored_with_motion.csv" : "xyz_restored_no_motion.csv");
+    save_restored_3d_points(restored_output_path, obs_by_frame, frame_numbers, poses,
+                            model_obj, part_order, fps, static_cast<int>(Ps.size()));
+    generated_files.push_back(restored_output_path);
 
     if (save_reproj) {
         cout << "\nStep 6: Saving debug diagnostics..." << endl;
@@ -1566,7 +1731,7 @@ int main(int argc, char** argv) {
         if (use_motion_track) {
             const string track_frame_path = join_path(debug_dir, "track_frame.csv");
             save_track_frame_errors(track_frame_path, frame_numbers, poses,
-                                    grid_step, fps, use_motion_track);
+                                    motion_track_center_obj, grid_step, fps, use_motion_track);
             generated_files.push_back(track_frame_path);
         }
     }
