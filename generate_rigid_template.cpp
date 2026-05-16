@@ -27,7 +27,6 @@ struct Obs2 {
     string part;
     double u, v;
     double t;
-    long long frame;
 };
 
 struct PartSampleStats {
@@ -41,6 +40,26 @@ struct PartSampleStats {
 struct SampleCollectionResult {
     unordered_map<string, vector<array<double, 3>>> part_samples;
     unordered_map<string, PartSampleStats> stats;
+};
+
+struct TriangResult {
+    long long frame = 0;
+    string part;
+    cv::Point3d X_world;
+    double reproj_err = numeric_limits<double>::infinity();
+};
+
+struct TriangulationPassResult {
+    vector<TriangResult> samples;
+    unordered_map<string, PartSampleStats> stats;
+};
+
+struct ReprojThresholdEstimate {
+    double threshold_px = 0.0;
+    double sigma_hat_px = 0.0;
+    double median_px = 0.0;
+    double mad_px = 0.0;
+    bool used_mad = false;
 };
 
 string remove_bom(const string& str);
@@ -159,7 +178,7 @@ string resolve_input_path(const string& path, const string& executable_dir) {
     return path;
 }
 
-vector<cv::Mat> load_Ps_txt_first3(const string& cams_path) {
+vector<cv::Mat> load_camera_matrices(const string& cams_path, int n_cameras = 3) {
     vector<cv::Mat> Ps;
     ifstream ifs(cams_path);
     if (!ifs.is_open()) {
@@ -171,7 +190,7 @@ vector<cv::Mat> load_Ps_txt_first3(const string& cams_path) {
     int count = 0;
     int line_num = 0;
 
-    while (getline(ifs, line) && count < 3) {
+    while (getline(ifs, line) && count < n_cameras) {
         line_num++;
 
         line.erase(0, line.find_first_not_of(" \t\r\n"));
@@ -210,8 +229,9 @@ vector<cv::Mat> load_Ps_txt_first3(const string& cams_path) {
 
     cout << "\nSuccessfully loaded " << Ps.size() << " camera projection matrices" << endl;
 
-    if (Ps.size() < 3) {
-        cerr << "\nERROR: Only found " << Ps.size() << " valid cameras, need 3" << endl;
+    if (Ps.size() < static_cast<size_t>(n_cameras)) {
+        cerr << "\nERROR: Only found " << Ps.size() << " valid cameras, need "
+             << n_cameras << endl;
     }
 
     return Ps;
@@ -242,7 +262,6 @@ vector<Obs2> load_obs_csv(const string& path, int cam_id) {
     }
 
     vector<string> header_fields = split_csv_line(remove_bom(line));
-    int frame_col = -1;
     int t_col = -1;
     int part_col = -1;
     int x_col = -1;
@@ -250,9 +269,7 @@ vector<Obs2> load_obs_csv(const string& path, int cam_id) {
 
     for (size_t i = 0; i < header_fields.size(); i++) {
         string name = normalize_header_name(header_fields[i]);
-        if (name == "frame") {
-            frame_col = static_cast<int>(i);
-        } else if (name == "t" || name == "time" || name == "timestamp") {
+        if (name == "t" || name == "time" || name == "timestamp") {
             t_col = static_cast<int>(i);
         } else if (name == "part" || name == "bodypart") {
             part_col = static_cast<int>(i);
@@ -274,23 +291,18 @@ vector<Obs2> load_obs_csv(const string& path, int cam_id) {
         if (trim_copy(line).empty()) continue;
 
         vector<string> fields = split_csv_line(line);
-        const int required_col = max({frame_col, t_col, part_col, x_col, y_col});
+        const int required_col = max({t_col, part_col, x_col, y_col});
         if (required_col >= static_cast<int>(fields.size())) {
             continue;
         }
 
         try {
-            long long frame = -1;
-            if (frame_col >= 0 && !fields[frame_col].empty()) {
-                frame = stoll(fields[frame_col]);
-            }
-
             double t = stod(fields[t_col]);
             const string& part = fields[part_col];
             double x = stod(fields[x_col]);
             double y = stod(fields[y_col]);
 
-            obs.push_back({cam_id, part, x, y, t, frame});
+            obs.push_back({cam_id, part, x, y, t});
         } catch (...) {
             continue;
         }
@@ -307,7 +319,7 @@ map<long long, vector<Obs2>> group_obs_by_frame(const vector<Obs2>& obsAll,
     unordered_map<string, bool> part_seen;
 
     for (const auto& ob : obsAll) {
-        long long frame = (ob.frame >= 0) ? ob.frame : (long long)round(ob.t * fps);
+        long long frame = static_cast<long long>(round(ob.t * fps));
         obs_by_frame[frame].push_back(ob);
 
         if (!part_seen[ob.part]) {
@@ -485,10 +497,6 @@ array<double, 3> vec_sub(const array<double, 3>& a, const array<double, 3>& b) {
     return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
 }
 
-array<double, 3> vec_add(const array<double, 3>& a, const array<double, 3>& b) {
-    return {a[0] + b[0], a[1] + b[1], a[2] + b[2]};
-}
-
 array<double, 3> vec_scale(const array<double, 3>& v, double s) {
     return {v[0] * s, v[1] * s, v[2] * s};
 }
@@ -632,45 +640,6 @@ void save_template(const string& path,
     }
 
     cout << "Saved template to " << path << endl;
-}
-
-void save_template_point_cloud_ply(const string& path,
-                                   const unordered_map<string, array<double, 3>>& model,
-                                   const vector<string>& part_order) {
-    ofstream ofs(path);
-    if (!ofs.is_open()) {
-        cerr << "WARNING: Cannot write point cloud " << path << endl;
-        return;
-    }
-
-    size_t vertex_count = 0;
-    for (const string& part : part_order) {
-        if (model.find(part) != model.end()) {
-            vertex_count++;
-        }
-    }
-
-    ofs << "ply\n";
-    ofs << "format ascii 1.0\n";
-    ofs << "comment Generated from final rigid template output\n";
-    ofs << "element vertex " << vertex_count << "\n";
-    ofs << "property float x\n";
-    ofs << "property float y\n";
-    ofs << "property float z\n";
-    ofs << "end_header\n";
-
-    for (const string& part : part_order) {
-        auto it = model.find(part);
-        if (it == model.end()) {
-            continue;
-        }
-
-        ofs << it->second[0] << " "
-            << it->second[1] << " "
-            << it->second[2] << "\n";
-    }
-
-    cout << "Saved template point cloud to " << path << endl;
 }
 
 vector<pair<string, string>> build_default_mouse_skeleton_edges(
@@ -885,25 +854,37 @@ double compute_median(vector<double> values) {
 
 vector<array<double, 3>> filter_spatial_outliers(
     const vector<array<double, 3>>& samples,
-    double outlier_thresh_mult) {
+    double outlier_k) {
 
     if (samples.size() < 4) {
         return samples;
     }
 
-    const array<double, 3> provisional_center = compute_coordinate_median_point(samples);
+    const array<double, 3> center = compute_coordinate_median_point(samples);
     vector<double> distances;
     distances.reserve(samples.size());
     for (const auto& sample : samples) {
-        distances.push_back(euclidean_distance_3d(sample, provisional_center));
+        distances.push_back(euclidean_distance_3d(sample, center));
     }
 
     const double median_dist = compute_median(distances);
-    if (!std::isfinite(median_dist) || median_dist < 1e-9) {
+    if (!std::isfinite(median_dist)) {
         return samples;
     }
 
-    const double dist_thresh = outlier_thresh_mult * median_dist;
+    vector<double> abs_dev;
+    abs_dev.reserve(distances.size());
+    for (double distance : distances) {
+        abs_dev.push_back(std::abs(distance - median_dist));
+    }
+
+    const double mad_dist = compute_median(abs_dev);
+    if (!std::isfinite(mad_dist) || mad_dist < 1e-9) {
+        return samples;
+    }
+
+    const double sigma_dist = mad_dist / 0.6745;
+    const double dist_thresh = median_dist + outlier_k * sigma_dist;
     vector<array<double, 3>> filtered;
     filtered.reserve(samples.size());
     for (size_t i = 0; i < samples.size(); i++) {
@@ -918,40 +899,25 @@ vector<array<double, 3>> filter_spatial_outliers(
     return filtered;
 }
 
-SampleCollectionResult collect_part_samples(
+TriangulationPassResult triangulate_all(
     const map<long long, vector<Obs2>>& obs_by_frame,
     const vector<cv::Mat>& Ps,
-    const vector<string>& part_order,
-    double reproj_thresh_px,
     double angle_thresh_deg,
-    int min_parts_for_frame_align) {
+    double bbox_min,
+    double bbox_max) {
 
-    SampleCollectionResult result;
+    TriangulationPassResult result;
     vector<cv::Point3d> camera_centers;
     camera_centers.reserve(Ps.size());
     for (const auto& P : Ps) {
         camera_centers.push_back(camera_center_from_P(P));
     }
 
-    size_t total_frames = obs_by_frame.size();
-    size_t frames_skipped_low_support = 0;
-    size_t frames_skipped_missing_head_center = 0;
-    size_t frames_skipped_missing_tail_root = 0;
-    size_t frames_skipped_missing_lr_reference = 0;
-    size_t frames_skipped_bad_alignment = 0;
-    size_t frames_accepted = 0;
-    size_t accepted_parts_accumulator = 0;
-    size_t lr_reference_ears = 0;
-    size_t lr_reference_front_paws = 0;
-    size_t lr_reference_hind_paws = 0;
-
     for (const auto& frame_entry : obs_by_frame) {
         unordered_map<string, vector<pair<int, cv::Point2d>>> part2views;
         for (const auto& ob : frame_entry.second) {
             part2views[ob.part].push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
         }
-
-        unordered_map<string, array<double, 3>> frame_points_world;
 
         for (const auto& kv : part2views) {
             if (kv.second.size() < 2) {
@@ -967,9 +933,10 @@ SampleCollectionResult collect_part_samples(
                 continue;
             }
 
-            const double mean_reproj_error = reproj_error_px(X, kv.second, Ps);
-            if (!std::isfinite(mean_reproj_error) || mean_reproj_error > reproj_thresh_px) {
-                stats.rejected_reproj++;
+            if (X.x < bbox_min || X.x > bbox_max ||
+                X.y < bbox_min || X.y > bbox_max ||
+                X.z < bbox_min || X.z > bbox_max) {
+                stats.rejected_invalid++;
                 continue;
             }
 
@@ -979,12 +946,99 @@ SampleCollectionResult collect_part_samples(
                 continue;
             }
 
-            frame_points_world[kv.first] = point3d_to_array(X);
-        }
+            const double mean_reproj_error = reproj_error_px(X, kv.second, Ps);
+            if (!std::isfinite(mean_reproj_error)) {
+                stats.rejected_invalid++;
+                continue;
+            }
 
-        if (static_cast<int>(frame_points_world.size()) < min_parts_for_frame_align) {
-            frames_skipped_low_support++;
+            result.samples.push_back({
+                frame_entry.first,
+                kv.first,
+                X,
+                mean_reproj_error
+            });
+        }
+    }
+
+    return result;
+}
+
+ReprojThresholdEstimate estimate_reproj_thresh(const vector<TriangResult>& all,
+                                               double adaptive_k) {
+    ReprojThresholdEstimate estimate;
+    if (all.empty()) {
+        return estimate;
+    }
+
+    vector<double> errs;
+    errs.reserve(all.size());
+    for (const auto& sample : all) {
+        if (std::isfinite(sample.reproj_err)) {
+            errs.push_back(sample.reproj_err);
+        }
+    }
+    if (errs.empty()) {
+        return estimate;
+    }
+
+    estimate.median_px = compute_median(errs);
+    vector<double> abs_dev;
+    abs_dev.reserve(errs.size());
+    for (double err : errs) {
+        abs_dev.push_back(std::abs(err - estimate.median_px));
+    }
+    estimate.mad_px = compute_median(abs_dev);
+
+    if (errs.size() >= 4 && std::isfinite(estimate.mad_px) && estimate.mad_px > 1e-9) {
+        estimate.used_mad = true;
+        estimate.sigma_hat_px = estimate.mad_px / 0.6745;
+        estimate.threshold_px = estimate.median_px + adaptive_k * estimate.sigma_hat_px;
+        return estimate;
+    }
+
+    estimate.sigma_hat_px = estimate.median_px;
+    estimate.threshold_px =
+        estimate.median_px + adaptive_k * std::max(estimate.sigma_hat_px, 1e-6);
+    return estimate;
+}
+
+SampleCollectionResult collect_filtered(
+    const map<long long, vector<Obs2>>& obs_by_frame,
+    const vector<TriangResult>& all,
+    const vector<string>& part_order,
+    const unordered_map<string, PartSampleStats>& initial_stats,
+    double reproj_thresh_px) {
+
+    SampleCollectionResult result;
+    result.stats = initial_stats;
+
+    unordered_map<long long, unordered_map<string, array<double, 3>>> frame_points_by_frame;
+    for (const auto& sample : all) {
+        PartSampleStats& stats = result.stats[sample.part];
+        if (!std::isfinite(sample.reproj_err) || sample.reproj_err > reproj_thresh_px) {
+            stats.rejected_reproj++;
             continue;
+        }
+        frame_points_by_frame[sample.frame][sample.part] = point3d_to_array(sample.X_world);
+    }
+
+    size_t total_frames = obs_by_frame.size();
+    size_t frames_skipped_missing_head_center = 0;
+    size_t frames_skipped_missing_tail_base = 0;
+    size_t frames_skipped_missing_lr_reference = 0;
+    size_t frames_skipped_bad_alignment = 0;
+    size_t frames_accepted = 0;
+    size_t accepted_parts_accumulator = 0;
+    size_t lr_reference_ears = 0;
+    size_t lr_reference_front_paws = 0;
+    size_t lr_reference_hind_paws = 0;
+
+    for (const auto& frame_entry : obs_by_frame) {
+        unordered_map<string, array<double, 3>> frame_points_world;
+        auto frame_it = frame_points_by_frame.find(frame_entry.first);
+        if (frame_it != frame_points_by_frame.end()) {
+            frame_points_world = frame_it->second;
         }
 
         if (frame_points_world.find("head center") == frame_points_world.end()) {
@@ -993,7 +1047,7 @@ SampleCollectionResult collect_part_samples(
         }
 
         if (frame_points_world.find("tail base") == frame_points_world.end()) {
-            frames_skipped_missing_tail_root++;
+            frames_skipped_missing_tail_base++;
             continue;
         }
 
@@ -1035,9 +1089,8 @@ SampleCollectionResult collect_part_samples(
 
     cout << "Frame alignment stats:"
          << " total_frames=" << total_frames
-         << ", skipped_low_support=" << frames_skipped_low_support
          << ", skipped_missing_head_center=" << frames_skipped_missing_head_center
-         << ", skipped_missing_tail_root=" << frames_skipped_missing_tail_root
+         << ", skipped_missing_tail_base=" << frames_skipped_missing_tail_base
          << ", skipped_missing_lr_reference=" << frames_skipped_missing_lr_reference
          << ", skipped_bad_alignment=" << frames_skipped_bad_alignment
          << ", accepted_frames=" << frames_accepted;
@@ -1108,10 +1161,9 @@ int main(int argc, char** argv) {
     string top_csv = "3cam/obs_de_top.csv";
     string output_path = "results/mouse_model_obj.csv";
     double fps = 30.0;
-    double reproj_thresh_px = 3.0;
-    double angle_thresh_deg = 5.0;
+    double adaptive_k = 2.5;
+    double angle_thresh_deg = 10.0;
     double outlier_thresh_mult = 3.0;
-    int min_parts_for_frame_align = 4;
 
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
@@ -1127,14 +1179,12 @@ int main(int argc, char** argv) {
             output_path = argv[++i];
         } else if (arg == "--fps" && i + 1 < argc) {
             fps = stod(argv[++i]);
-        } else if (arg == "--reproj-thresh" && i + 1 < argc) {
-            reproj_thresh_px = stod(argv[++i]);
+        } else if (arg == "--adaptive-k" && i + 1 < argc) {
+            adaptive_k = stod(argv[++i]);
         } else if (arg == "--angle-thresh" && i + 1 < argc) {
             angle_thresh_deg = stod(argv[++i]);
         } else if (arg == "--outlier-mult" && i + 1 < argc) {
             outlier_thresh_mult = stod(argv[++i]);
-        } else if (arg == "--min-parts-frame" && i + 1 < argc) {
-            min_parts_for_frame_align = stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             cout << "Usage: " << argv[0] << " [options]\n";
             cout << "Options:\n";
@@ -1144,10 +1194,9 @@ int main(int argc, char** argv) {
             cout << "  --top <path>        Top camera CSV (default: 3cam/obs_de_top.csv)\n";
             cout << "  --output <path>     Output template CSV (default: results/mouse_model_obj.csv)\n";
             cout << "  --fps <value>       Frame rate (default: 30.0)\n";
-            cout << "  --reproj-thresh <value>   Mean reprojection threshold in px (default: 3.0)\n";
-            cout << "  --angle-thresh <value>    Minimum triangulation angle in deg (default: 5.0)\n";
+            cout << "  --adaptive-k <value>      MAD multiplier for adaptive reprojection filtering (default: 2.5)\n";
+            cout << "  --angle-thresh <value>    Minimum triangulation angle in deg (default: 10.0)\n";
             cout << "  --outlier-mult <value>    Spatial outlier distance multiplier (default: 3.0)\n";
-            cout << "  --min-parts-frame <value> Minimum accepted parts per frame for body-frame alignment (default: 4)\n";
             cout << "  --help, -h          Show this help\n";
             return 0;
         }
@@ -1165,16 +1214,14 @@ int main(int argc, char** argv) {
     cout << "Resolved side CSV: " << side_csv << endl;
     cout << "Resolved top CSV: " << top_csv << endl;
     cout << "Output template CSV: " << output_path << endl;
-    cout << "Output skeleton PLY: " << replace_extension(output_path, ".ply") << endl;
     cout << "Output skeleton HTML: " << replace_extension(output_path, ".html") << endl;
-    cout << "Reprojection threshold (px): " << reproj_thresh_px << endl;
+    cout << "Adaptive reprojection k: " << adaptive_k << endl;
     cout << "Triangulation angle threshold (deg): " << angle_thresh_deg << endl;
     cout << "Spatial outlier threshold multiplier: " << outlier_thresh_mult << endl;
-    cout << "Minimum accepted parts per frame: " << min_parts_for_frame_align << endl;
     cout << endl;
 
     cout << "Step 1: Loading data..." << endl;
-    vector<cv::Mat> Ps = load_Ps_txt_first3(cams_path);
+    vector<cv::Mat> Ps = load_camera_matrices(cams_path);
     if (Ps.size() != 3) {
         cerr << "ERROR: Need exactly 3 cameras" << endl;
         return -1;
@@ -1196,13 +1243,40 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    cout << "\nStep 2: Collecting head-centered, body-axis aligned local samples across frames..." << endl;
-    SampleCollectionResult collection =
-        collect_part_samples(obs_by_frame, Ps, part_order,
-                             reproj_thresh_px, angle_thresh_deg,
-                             min_parts_for_frame_align);
+    cout << "\nStep 2: Triangulating with geometry filtering..." << endl;
+    const double bbox_min = -100.0;
+    const double bbox_max = 650.0;
+    TriangulationPassResult triangulation =
+        triangulate_all(obs_by_frame, Ps, angle_thresh_deg, bbox_min, bbox_max);
+    if (triangulation.samples.empty()) {
+        cerr << "ERROR: No triangulated candidates survived geometry filtering" << endl;
+        return -1;
+    }
 
-    cout << "\nStep 3: Aggregating per-part body-aligned local samples with coordinate-wise medians..." << endl;
+    const ReprojThresholdEstimate reproj_estimate =
+        estimate_reproj_thresh(triangulation.samples, adaptive_k);
+    if (!std::isfinite(reproj_estimate.threshold_px) || reproj_estimate.threshold_px <= 0.0) {
+        cerr << "ERROR: Failed to estimate a valid adaptive reprojection threshold" << endl;
+        return -1;
+    }
+
+    cout << "Geometry-filtered triangulated samples: " << triangulation.samples.size() << endl;
+    cout << "Adaptive reprojection threshold: " << reproj_estimate.threshold_px << " px";
+    if (reproj_estimate.used_mad) {
+        cout << " (sigma_hat=" << reproj_estimate.sigma_hat_px
+             << " px, median=" << reproj_estimate.median_px
+             << " px, mad=" << reproj_estimate.mad_px << " px)";
+    } else {
+        cout << " (median fallback=" << reproj_estimate.median_px << " px)";
+    }
+    cout << endl;
+
+    cout << "\nStep 3: Collecting head-centered, body-axis aligned local samples across frames..." << endl;
+    SampleCollectionResult collection =
+        collect_filtered(obs_by_frame, triangulation.samples, part_order,
+                         triangulation.stats, reproj_estimate.threshold_px);
+
+    cout << "\nStep 4: Aggregating per-part body-aligned local samples with coordinate-wise medians..." << endl;
     unordered_map<string, array<double, 3>> model_local =
         aggregate_model_local(collection.part_samples, part_order, outlier_thresh_mult);
     if (model_local.empty()) {
@@ -1210,14 +1284,13 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    cout << "\nStep 4: Final template cleanup..." << endl;
+    cout << "\nStep 5: Final template cleanup..." << endl;
     unordered_map<string, array<double, 3>> model_obj = model_local;
     cout << "This template is head-centered and body-axis aligned" << endl;
     cout << "No final centroid recenter applied" << endl;
 
-    cout << "\nStep 5: Saving template..." << endl;
+    cout << "\nStep 6: Saving template..." << endl;
     save_template(output_path, model_obj, part_order);
-    save_template_point_cloud_ply(replace_extension(output_path, ".ply"), model_obj, part_order);
     save_template_skeleton_html(replace_extension(output_path, ".html"), model_obj, part_order);
 
     cout << "\n=== All done! ===" << endl;
