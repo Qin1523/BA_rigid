@@ -1384,7 +1384,7 @@ int main(int argc, char** argv) {
     string front_csv = "3cam/obs_de_front.csv";
     string side_csv = "3cam/obs_de_side.csv";
     string top_csv = "3cam/obs_de_top.csv";
-    string template_path = "mouse_model_obj.csv";
+    string template_path = "results/mouse_model_obj.csv";
     string output_dir = "results";
     string mt_center_part = "";
     bool mt_center_part_specified = false;
@@ -1441,13 +1441,13 @@ int main(int argc, char** argv) {
             cout << "  --front <path>      Front camera CSV (default: 3cam/obs_de_front.csv)\n";
             cout << "  --side <path>       Side camera CSV (default: 3cam/obs_de_side.csv)\n";
             cout << "  --top <path>        Top camera CSV (default: 3cam/obs_de_top.csv)\n";
-            cout << "  --template <path>   Rigid template CSV (default: mouse_model_obj.csv)\n";
+            cout << "  --template <path>   Rigid template CSV (default: results/mouse_model_obj.csv)\n";
             cout << "  --fps <value>       Frame rate (default: 30.0)\n";
             cout << "  --warm-start        Enable per-frame pose warm start\n";
             cout << "  --motion-track      Enable motion-track constraint\n";
             cout << "  --no-motion-track   Disable motion-track constraint\n";
             cout << "  --save-init         Save init and optional warm-start pose/xyz analysis under <outdir>/debug/\n";
-            cout << "  --save-reproj       Save final reprojection diagnostics under <outdir>/debug/\n";
+            cout << "  --save-reproj       Save final reprojection diagnostics under <outdir>/debug/\ng";
             cout << "  --lambda <value>    Motion-track weight (default: 1.0)\n";
             cout << "  --grid-step <value> Grid step in mm (default: 10.0)\n";
             cout << "  --grid_step <value> Alias for --grid-step\n";
@@ -1465,7 +1465,6 @@ int main(int argc, char** argv) {
     side_csv = resolve_input_path(side_csv, executable_dir);
     top_csv = resolve_input_path(top_csv, executable_dir);
     template_path = resolve_input_path(template_path, executable_dir);
-
     cout << "\n=== BA Motion Track ===\n" << endl;
     cout << "FPS: " << fps << endl;
     cout << "Warm start: " << (use_warm_start ? "ON" : "OFF") << endl;
