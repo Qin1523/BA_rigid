@@ -4,10 +4,13 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <array>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
+#include <thread>
 #include <cctype>
 #include <cerrno>
 #include <sys/stat.h>
@@ -96,6 +99,18 @@ string normalize_header_name(string name) {
         }
     }
     return normalized;
+}
+
+// Return the first column index whose normalised name matches any key; -1 if not found.
+int find_column_index(const vector<string>& header_fields,
+                      const vector<string>& keys) {
+    for (size_t i = 0; i < header_fields.size(); i++) {
+        string name = normalize_header_name(header_fields[i]);
+        for (const auto& key : keys) {
+            if (name == key) return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 
 string get_executable_dir(const char* argv0) {
@@ -266,26 +281,11 @@ vector<Obs2> load_obs_csv(const string& path, int cam_id) {
     }
 
     vector<string> header_fields = split_csv_line(remove_bom(line));
-    int frame_col = -1;
-    int t_col = -1;
-    int part_col = -1;
-    int x_col = -1;
-    int y_col = -1;
-
-    for (size_t i = 0; i < header_fields.size(); i++) {
-        string name = normalize_header_name(header_fields[i]);
-        if (name == "frame") {
-            frame_col = static_cast<int>(i);
-        } else if (name == "t" || name == "time" || name == "timestamp") {
-            t_col = static_cast<int>(i);
-        } else if (name == "part" || name == "bodypart") {
-            part_col = static_cast<int>(i);
-        } else if (name == "x" || name == "u") {
-            x_col = static_cast<int>(i);
-        } else if (name == "y" || name == "v") {
-            y_col = static_cast<int>(i);
-        }
-    }
+    int frame_col = find_column_index(header_fields, {"frame"});
+    int t_col     = find_column_index(header_fields, {"t", "time", "timestamp"});
+    int part_col  = find_column_index(header_fields, {"part", "bodypart"});
+    int x_col     = find_column_index(header_fields, {"x", "u"});
+    int y_col     = find_column_index(header_fields, {"y", "v"});
 
     if (t_col < 0 || part_col < 0 || x_col < 0 || y_col < 0) {
         cerr << "ERROR: CSV header in " << path
@@ -353,6 +353,38 @@ map<long long, vector<Obs2>> group_obs_by_frame(const vector<Obs2>& obsAll, doub
     return obs_by_frame;
 }
 
+// Infer the frame step from consecutive frame-number differences.
+long long infer_frame_step(const map<long long, vector<Obs2>>& obs_by_frame) {
+    if (obs_by_frame.size() < 2) return 1;
+    long long min_step = LLONG_MAX;
+    auto it = obs_by_frame.begin();
+    auto prev_it = it++;
+    for (; it != obs_by_frame.end(); ++it, ++prev_it) {
+        long long diff = it->first - prev_it->first;
+        if (diff > 0 && diff < min_step) min_step = diff;
+    }
+    return (min_step == LLONG_MAX) ? 1 : min_step;
+}
+
+// Return the set of frame numbers that are absent from obs_by_frame but lie
+// within [first, last] on the inferred regular grid.
+vector<long long> find_gap_frames(
+    const map<long long, vector<Obs2>>& obs_by_frame,
+    long long frame_step) {
+
+    vector<long long> gaps;
+    if (obs_by_frame.empty()) return gaps;
+
+    long long first = obs_by_frame.begin()->first;
+    long long last  = obs_by_frame.rbegin()->first;
+
+    for (long long fr = first; fr <= last; fr += frame_step) {
+        if (obs_by_frame.find(fr) == obs_by_frame.end())
+            gaps.push_back(fr);
+    }
+    return gaps;
+}
+
 // ============================================================================
 // 2) Triangulation and template I/O helpers
 // ============================================================================
@@ -417,23 +449,10 @@ unordered_map<string, array<double, 3>> load_template(const string& path) {
     }
 
     vector<string> header_fields = split_csv_line(remove_bom(line));
-    int part_col = -1;
-    int x_col = -1;
-    int y_col = -1;
-    int z_col = -1;
-
-    for (size_t i = 0; i < header_fields.size(); i++) {
-        string name = normalize_header_name(header_fields[i]);
-        if (name == "part" || name == "bodypart") {
-            part_col = static_cast<int>(i);
-        } else if (name == "x") {
-            x_col = static_cast<int>(i);
-        } else if (name == "y") {
-            y_col = static_cast<int>(i);
-        } else if (name == "z") {
-            z_col = static_cast<int>(i);
-        }
-    }
+    int part_col = find_column_index(header_fields, {"part", "bodypart"});
+    int x_col    = find_column_index(header_fields, {"x"});
+    int y_col    = find_column_index(header_fields, {"y"});
+    int z_col    = find_column_index(header_fields, {"z"});
 
     if (part_col < 0 || x_col < 0 || y_col < 0 || z_col < 0) {
         cerr << "ERROR: Template header in " << path
@@ -474,54 +493,82 @@ double distance_3d(const array<double, 3>& a,
     return sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+// Build one translation seed per segment of segment_length consecutive frames.
 bool estimate_initial_translation_from_sequence(
     const map<long long, vector<Obs2>>& obs_by_frame,
     const unordered_map<string, array<double, 3>>& model_obj,
     const vector<cv::Mat>& Ps,
-    array<double, 3>& translation_seed_world, long long& seed_frame) {
+    map<long long, array<double, 3>>& seed_map,
+    int segment_length = 150) {
+
+    seed_map.clear();
 
     if (obs_by_frame.empty()) {
-        cerr << "ERROR: No frames are available for initial translation estimation" << endl;
+        cerr << "ERROR: No frames available for translation seed estimation" << endl;
         return false;
     }
-
     if (!model_obj.count("head center")) {
-        cerr << "ERROR: Template does not contain 'head center'; cannot estimate the initial translation seed" << endl;
+        cerr << "ERROR: Template does not contain 'head center'" << endl;
         return false;
     }
 
-    for (const auto& kv : obs_by_frame) {
-        const long long fr = kv.first;
-        const vector<Obs2>& obs_frame = kv.second;
+    long long first_frame = obs_by_frame.begin()->first;
+    long long last_frame  = obs_by_frame.rbegin()->first;
+    long long total_frames = last_frame - first_frame + 1;
+    int num_segments = static_cast<int>(
+        ceil(static_cast<double>(total_frames) / segment_length));
 
-        vector<pair<int, cv::Point2d>> head_center_views;
-        for (const auto& ob : obs_frame) {
-            if (ob.part == "head center") {
-                head_center_views.push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
+    for (int seg = 0; seg < num_segments; seg++) {
+        long long seg_start = first_frame + seg * segment_length;
+        long long seg_end   = seg_start + segment_length - 1;
+
+        for (const auto& kv : obs_by_frame) {
+            if (kv.first < seg_start || kv.first > seg_end) continue;
+
+            vector<pair<int, cv::Point2d>> hc_views;
+            for (const auto& ob : kv.second) {
+                if (ob.part == "head center")
+                    hc_views.push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
             }
-        }
+            if (hc_views.size() < 2) continue;
 
-        if (head_center_views.size() < 2) {
-            continue;
-        }
+            cv::Point3d X_hc = triangulate_DLT(hc_views, Ps);
+            if (!std::isfinite(X_hc.x) || !std::isfinite(X_hc.y) || !std::isfinite(X_hc.z))
+                continue;
 
-        cv::Point3d X_hc = triangulate_DLT(head_center_views, Ps);
-        if (!std::isfinite(X_hc.x) || !std::isfinite(X_hc.y) || !std::isfinite(X_hc.z)) {
-            continue;
+            seed_map[seg_start] = {X_hc.x, X_hc.y, X_hc.z};
+            cout << "Segment [" << seg_start << ", " << seg_end
+                 << "] seed from frame " << kv.first << ": ("
+                 << X_hc.x << ", " << X_hc.y << ", " << X_hc.z << ")" << endl;
+            break;
         }
-
-        translation_seed_world = {X_hc.x, X_hc.y, X_hc.z};
-        seed_frame = fr;
-        cout << "Initial translation seed fixed from head center at frame "
-             << seed_frame << ": ("
-             << translation_seed_world[0] << ", "
-             << translation_seed_world[1] << ", "
-             << translation_seed_world[2] << ")" << endl;
-        return true;
     }
 
-    cerr << "ERROR: Could not find any frame with a valid triangulatable 'head center' (requires >=2 views)" << endl;
-    return false;
+    if (seed_map.empty()) {
+        cerr << "ERROR: Could not find any valid head center for translation seeding" << endl;
+        return false;
+    }
+    cout << "Total translation seeds: " << seed_map.size()
+         << " (out of " << num_segments << " segments)" << endl;
+    return true;
+}
+
+// Look up the nearest translation seed for a given frame number.
+array<double, 3> lookup_translation_seed(
+    long long frame,
+    const map<long long, array<double, 3>>& seed_map) {
+
+    if (seed_map.empty()) return {0.0, 0.0, 0.0};
+
+    auto it = seed_map.lower_bound(frame);
+
+    if (it == seed_map.begin()) return it->second;
+    if (it == seed_map.end())   return prev(it)->second;
+
+    auto prev_it = prev(it);
+    long long dist_prev = frame - prev_it->first;
+    long long dist_next = it->first - frame;
+    return (dist_prev <= dist_next) ? prev_it->second : it->second;
 }
 
 array<double, 3> compute_template_centroid_obj(
@@ -579,7 +626,11 @@ bool compute_template_body_scale_stats(
 struct PoseReprojCost {
     PoseReprojCost(const cv::Mat& P, const array<double, 3>& X_obj,
                    double u_obs, double v_obs)
-        : P_(P), X_obj_(X_obj), u_obs_(u_obs), v_obs_(v_obs) {}
+        : X_obj_(X_obj), u_obs_(u_obs), v_obs_(v_obs) {
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++)
+                P_[i * 4 + j] = P.at<double>(i, j);
+    }
 
     template <typename T>
     bool operator()(const T* const pose, T* residuals) const {
@@ -608,9 +659,9 @@ struct PoseReprojCost {
         T u_pred = T(0.0), v_pred = T(0.0), w_pred = T(0.0);
 
         for (int j = 0; j < 4; j++) {
-            u_pred += T(P_.at<double>(0, j)) * X_homo[j];
-            v_pred += T(P_.at<double>(1, j)) * X_homo[j];
-            w_pred += T(P_.at<double>(2, j)) * X_homo[j];
+            u_pred += T(P_[0 * 4 + j]) * X_homo[j];
+            v_pred += T(P_[1 * 4 + j]) * X_homo[j];
+            w_pred += T(P_[2 * 4 + j]) * X_homo[j];
         }
 
         u_pred /= w_pred;
@@ -631,7 +682,7 @@ struct PoseReprojCost {
     }
 
 private:
-    cv::Mat P_;
+    double P_[12];
     array<double, 3> X_obj_;
     double u_obs_, v_obs_;
 };
@@ -793,11 +844,13 @@ void global_bundle_adjustment(
 
     ceres::Problem prob;
     ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
+    static const vector<Obs2> empty_obs;
 
     // 4.1 Add all reprojection residuals.
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
-        const auto& obs_frame = obs_by_frame[fr];
+        auto obs_it = obs_by_frame.find(fr);
+        const auto& obs_frame = (obs_it != obs_by_frame.end()) ? obs_it->second : empty_obs;
 
         for (const auto& ob : obs_frame) {
             if (!model_obj.count(ob.part)) continue;
@@ -839,7 +892,7 @@ void global_bundle_adjustment(
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;  // Sparse solver for the global problem.
     options.max_num_iterations = 200;
     options.minimizer_progress_to_stdout = true;
-    options.num_threads = 4;  // Use multithreading where available.
+    options.num_threads = static_cast<int>(std::thread::hardware_concurrency());
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &prob, &summary);
@@ -992,6 +1045,28 @@ TrackErrorStats compute_track_error_for_frame(
 // 6) Error reporting
 // ============================================================================
 
+struct ErrorStats {
+    double rmse;
+    double mean_abs;
+    double max_abs;
+    size_t count;
+};
+
+ErrorStats compute_error_stats(const vector<double>& errors) {
+    ErrorStats s{0.0, 0.0, 0.0, errors.size()};
+    if (errors.empty()) return s;
+    double sum = 0.0, sum_sq = 0.0, max_err = 0.0;
+    for (double e : errors) {
+        sum    += e;
+        sum_sq += e * e;
+        if (e > max_err) max_err = e;
+    }
+    s.rmse     = sqrt(sum_sq / errors.size());
+    s.mean_abs = sum / errors.size();
+    s.max_abs  = max_err;
+    return s;
+}
+
 // (1) Reprojection error statistics per frame.
 void save_reproj_frame_errors(
     const string& path,
@@ -1009,12 +1084,6 @@ void save_reproj_frame_errors(
     }
 
     ofs << "frame,t,num_obs,rmse_px,mean_abs_px,max_abs_px\n";
-
-    // Build a frame-to-pose index map.
-    unordered_map<long long, size_t> frame_to_idx;
-    for (size_t i = 0; i < frame_numbers.size(); i++) {
-        frame_to_idx[frame_numbers[i]] = i;
-    }
 
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
@@ -1041,19 +1110,9 @@ void save_reproj_frame_errors(
 
         if (errors.empty()) continue;
 
-        // Aggregate frame-level statistics.
-        double sum = 0, sum_sq = 0, max_err = 0;
-        for (double e : errors) {
-            sum += e;
-            sum_sq += e * e;
-            if (e > max_err) max_err = e;
-        }
-
-        double rmse = sqrt(sum_sq / errors.size());
-        double mean = sum / errors.size();
-
+        auto stats = compute_error_stats(errors);
         ofs << fr << "," << t << "," << errors.size() << ","
-            << rmse << "," << mean << "," << max_err << "\n";
+            << stats.rmse << "," << stats.mean_abs << "," << stats.max_abs << "\n";
     }
 
     cout << "Saved reprojection errors (per frame) to " << path << endl;
@@ -1107,18 +1166,9 @@ void save_reproj_frame_cam_errors(
 
             if (errors.empty()) continue;
 
-            double sum = 0, sum_sq = 0, max_err = 0;
-            for (double e : errors) {
-                sum += e;
-                sum_sq += e * e;
-                if (e > max_err) max_err = e;
-            }
-
-            double rmse = sqrt(sum_sq / errors.size());
-            double mean = sum / errors.size();
-
+            auto stats = compute_error_stats(errors);
             ofs << fr << "," << t << "," << cam << "," << errors.size() << ","
-                << rmse << "," << mean << "," << max_err << "\n";
+                << stats.rmse << "," << stats.mean_abs << "," << stats.max_abs << "\n";
         }
     }
 
@@ -1173,18 +1223,9 @@ void save_reproj_frame_part_errors(
 
             if (errors.empty()) continue;
 
-            double sum = 0, sum_sq = 0, max_err = 0;
-            for (double e : errors) {
-                sum += e;
-                sum_sq += e * e;
-                if (e > max_err) max_err = e;
-            }
-
-            double rmse = sqrt(sum_sq / errors.size());
-            double mean = sum / errors.size();
-
+            auto stats = compute_error_stats(errors);
             ofs << fr << "," << t << "," << part << "," << errors.size() << ","
-                << rmse << "," << mean << "," << max_err << "\n";
+                << stats.rmse << "," << stats.mean_abs << "," << stats.max_abs << "\n";
         }
     }
 
@@ -1198,8 +1239,7 @@ void save_track_frame_errors(
     const vector<array<double, 6>>& poses,
     const array<double, 3>& grid_center_obj,
     double grid_step,
-    double fps,
-    bool use_motion_track) {
+    double fps) {
 
     ofstream ofs(path);
     if (!ofs.is_open()) {
@@ -1207,12 +1247,7 @@ void save_track_frame_errors(
         return;
     }
 
-    ofs << "frame,t,track_rmse,track_mean_abs,track_max_abs\n";
-
-    if (!use_motion_track) {
-        cout << "Motion-track disabled, writing empty track errors file" << endl;
-        return;
-    }
+    ofs << "frame,t,track_rmse_mm,track_mean_abs_mm,track_max_abs_mm\n";
 
     // Only middle frames have a full five-frame neighborhood.
     for (size_t i = 2; i + 2 < frame_numbers.size(); i++) {
@@ -1239,21 +1274,23 @@ void save_track_frame_errors(
 void save_poses(const string& path,
                 const vector<long long>& frame_numbers,
                 const vector<array<double, 6>>& poses,
-                double fps) {
+                double fps,
+                bool use_motion_track) {
     ofstream ofs(path);
     if (!ofs.is_open()) {
         cerr << "ERROR: Cannot write " << path << endl;
         return;
     }
 
-    ofs << "frame,t,rx,ry,rz,tx,ty,tz\n";
+    ofs << "frame,t,rx,ry,rz,tx,ty,tz,motion_track\n";
 
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
         double t = fr / fps;
         ofs << fr << "," << t << ","
             << poses[i][0] << "," << poses[i][1] << "," << poses[i][2] << ","
-            << poses[i][3] << "," << poses[i][4] << "," << poses[i][5] << "\n";
+            << poses[i][3] << "," << poses[i][4] << "," << poses[i][5] << ","
+            << (use_motion_track ? 1 : 0) << "\n";
     }
 
     cout << "Saved poses to " << path << endl;
@@ -1288,16 +1325,8 @@ void save_3d_points(const string& path,
 
             const auto& X_obj = it->second;
 
-            // Apply rotation.
-            double X_rot[3];
-            ceres::AngleAxisRotatePoint(pose.data(), X_obj.data(), X_rot);
-
-            // Apply translation.
-            double X_world[3] = {
-                X_rot[0] + pose[3],
-                X_rot[1] + pose[4],
-                X_rot[2] + pose[5]
-            };
+            array<double, 3> X_world;
+            apply_pose_transform(pose, X_obj, X_world);
 
             ofs << fr << "," << t << "," << part << ","
                 << X_world[0] << "," << X_world[1] << "," << X_world[2] << "\n";
@@ -1315,7 +1344,8 @@ void save_restored_3d_points(
     const unordered_map<string, array<double, 3>>& model_obj,
     const vector<string>& part_order,
     double fps,
-    int num_cams) {
+    int num_cams,
+    const unordered_set<long long>& gap_frame_set) {
     ofstream ofs(path);
     if (!ofs.is_open()) {
         cerr << "ERROR: Cannot write " << path << endl;
@@ -1363,7 +1393,14 @@ void save_restored_3d_points(
                 num_obs = count_it->second;
             }
 
-            int restored = (num_obs < num_cams) ? 1 : 0;
+            int restored;
+            if (gap_frame_set.count(fr)) {
+                restored = 2;          // Fully missing frame; pose from spline interpolation.
+            } else if (num_obs < num_cams) {
+                restored = 1;          // Partial observations; pose supported by reprojection.
+            } else {
+                restored = 0;          // All cameras observed.
+            }
 
             ofs << fr << "," << t << "," << part << ","
                 << X_world[0] << "," << X_world[1] << "," << X_world[2] << ","
@@ -1372,6 +1409,100 @@ void save_restored_3d_points(
     }
 
     cout << "Saved restored-aware 3D points to " << path << endl;
+}
+
+// ============================================================================
+// 8) Spline interpolation for gap-frame pose infill
+// ============================================================================
+
+// Natural cubic spline interpolation. x_vals must be strictly increasing.
+// Returns interpolated values at each query_x; boundary values are clamped.
+vector<double> cubic_spline_interpolate(
+    const vector<double>& x_vals,
+    const vector<double>& y_vals,
+    const vector<double>& query_x) {
+
+    int n = static_cast<int>(x_vals.size());
+    vector<double> result(query_x.size(), 0.0);
+    if (n < 2) {
+        double val = y_vals.empty() ? 0.0 : y_vals[0];
+        fill(result.begin(), result.end(), val);
+        return result;
+    }
+
+    vector<double> h(n - 1);
+    for (int i = 0; i < n - 1; i++) h[i] = x_vals[i + 1] - x_vals[i];
+
+    vector<double> alpha(n, 0.0);
+    for (int i = 1; i < n - 1; i++) {
+        alpha[i] = (3.0 / h[i]) * (y_vals[i + 1] - y_vals[i])
+                 - (3.0 / h[i - 1]) * (y_vals[i] - y_vals[i - 1]);
+    }
+
+    vector<double> l(n, 1.0), mu(n, 0.0), z(n, 0.0);
+    for (int i = 1; i < n - 1; i++) {
+        l[i]  = 2.0 * (x_vals[i + 1] - x_vals[i - 1]) - h[i - 1] * mu[i - 1];
+        mu[i] = h[i] / l[i];
+        z[i]  = (alpha[i] - h[i - 1] * z[i - 1]) / l[i];
+    }
+
+    vector<double> c(n, 0.0), b(n, 0.0), d(n, 0.0);
+    for (int j = n - 2; j >= 0; j--) {
+        c[j] = z[j] - mu[j] * c[j + 1];
+        b[j] = (y_vals[j + 1] - y_vals[j]) / h[j]
+             - h[j] * (c[j + 1] + 2.0 * c[j]) / 3.0;
+        d[j] = (c[j + 1] - c[j]) / (3.0 * h[j]);
+    }
+
+    for (size_t qi = 0; qi < query_x.size(); qi++) {
+        double qx = query_x[qi];
+        if (qx <= x_vals.front()) { result[qi] = y_vals.front(); continue; }
+        if (qx >= x_vals.back())  { result[qi] = y_vals.back();  continue; }
+
+        int lo = 0, hi = n - 2;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;
+            if (x_vals[mid] <= qx) lo = mid; else hi = mid - 1;
+        }
+        int j = lo;
+        double dx = qx - x_vals[j];
+        result[qi] = y_vals[j] + b[j] * dx + c[j] * dx * dx + d[j] * dx * dx * dx;
+    }
+    return result;
+}
+
+// Interpolate poses for gap frames using the known observed-frame poses.
+void interpolate_gap_poses(
+    const vector<long long>& known_frames,
+    const vector<array<double, 6>>& known_poses,
+    const vector<long long>& gap_frames,
+    vector<array<double, 6>>& gap_poses) {
+
+    gap_poses.clear();
+    if (gap_frames.empty()) return;
+    if (known_frames.empty()) {
+        gap_poses.assign(gap_frames.size(), {0, 0, 0, 0, 0, 0});
+        return;
+    }
+
+    vector<double> x_known(known_frames.size());
+    for (size_t i = 0; i < known_frames.size(); i++)
+        x_known[i] = static_cast<double>(known_frames[i]);
+
+    vector<double> x_query(gap_frames.size());
+    for (size_t i = 0; i < gap_frames.size(); i++)
+        x_query[i] = static_cast<double>(gap_frames[i]);
+
+    gap_poses.resize(gap_frames.size());
+    for (int comp = 0; comp < 6; comp++) {
+        vector<double> y_known(known_frames.size());
+        for (size_t i = 0; i < known_frames.size(); i++)
+            y_known[i] = known_poses[i][comp];
+
+        vector<double> y_interp = cubic_spline_interpolate(x_known, y_known, x_query);
+        for (size_t i = 0; i < gap_frames.size(); i++)
+            gap_poses[i][comp] = y_interp[i];
+    }
 }
 
 // ============================================================================
@@ -1557,13 +1688,10 @@ int main(int argc, char** argv) {
     cout << "Motion-track body scale for residual normalization: "
          << motion_track_body_scale << endl;
 
-    array<double, 3> initial_translation_world = {0.0, 0.0, 0.0};
-    long long seed_frame = -1;
-    if (!estimate_initial_translation_from_sequence(obs_by_frame, model_obj, Ps,
-                                                    initial_translation_world, seed_frame)) {
+    map<long long, array<double, 3>> seed_map;
+    if (!estimate_initial_translation_from_sequence(obs_by_frame, model_obj, Ps, seed_map)) {
         return -1;
     }
-    cout << "Initial pose seed frame (confirmed): " << seed_frame << endl;
 
     array<double, 3> motion_track_center_obj = template_centroid_obj;
     if (mt_center_part_specified) {
@@ -1620,18 +1748,27 @@ int main(int argc, char** argv) {
     // 3) Prepare the initial poses for global BA.
     cout << "\nStep 3: Preparing initial poses..." << endl;
 
+    const vector<Obs2> empty_obs;   // Fallback for frames with no observations.
+
+    // 3.1 Infer frame step and find gap frames.
+    long long frame_step = infer_frame_step(obs_by_frame);
+    vector<long long> gap_frames = find_gap_frames(obs_by_frame, frame_step);
+    if (!gap_frames.empty()) {
+        cout << "Detected " << gap_frames.size() << " gap frames (step="
+             << frame_step << ")" << endl;
+    }
+
+    // 3.2 Build observed-frame list (with stride).
     vector<long long> frame_numbers;
     vector<array<double, 6>> poses;
 
-    // Subsample frames according to the requested stride.
     int frame_idx = 0;
     for (const auto& kv : obs_by_frame) {
         if (frame_idx % frame_stride == 0) {
             frame_numbers.push_back(kv.first);
-            poses.push_back({0, 0, 0,
-                             initial_translation_world[0],
-                             initial_translation_world[1],
-                             initial_translation_world[2]});
+            auto t_seed = lookup_translation_seed(kv.first, seed_map);
+            poses.push_back({0.0, 0.0, 0.0,
+                             t_seed[0], t_seed[1], t_seed[2]});
         }
         frame_idx++;
     }
@@ -1645,7 +1782,7 @@ int main(int argc, char** argv) {
     if (save_init) {
         const string init_pose_path = join_path(debug_dir, "init_pose.csv");
         const string init_xyz_path = join_path(debug_dir, "init_xyz.csv");
-        save_poses(init_pose_path, frame_numbers, poses, fps);
+        save_poses(init_pose_path, frame_numbers, poses, fps, use_motion_track);
         save_3d_points(init_xyz_path, frame_numbers, poses, model_obj, part_order, fps);
         generated_files.push_back(init_pose_path);
         generated_files.push_back(init_xyz_path);
@@ -1661,7 +1798,9 @@ int main(int argc, char** argv) {
                 poses[i] = poses[i-1];
             }
 
-            initialize_pose_per_frame(i, obs_by_frame[fr], model_obj, Ps, poses[i].data());
+            auto ws_it = obs_by_frame.find(fr);
+            const auto& ws_obs = (ws_it != obs_by_frame.end()) ? ws_it->second : empty_obs;
+            initialize_pose_per_frame(i, ws_obs, model_obj, Ps, poses[i].data());
 
             if ((i+1) % 10 == 0 || i+1 == frame_numbers.size()) {
                 cout << "Warm-start initialized " << (i+1) << "/" << frame_numbers.size() << " frames" << endl;
@@ -1673,7 +1812,7 @@ int main(int argc, char** argv) {
         if (save_init) {
             const string warm_start_pose_path = join_path(debug_dir, "warm_start_pose.csv");
             const string warm_start_xyz_path = join_path(debug_dir, "warm_start_xyz.csv");
-            save_poses(warm_start_pose_path, frame_numbers, poses, fps);
+            save_poses(warm_start_pose_path, frame_numbers, poses, fps, use_motion_track);
             save_3d_points(warm_start_xyz_path, frame_numbers, poses, model_obj, part_order, fps);
             generated_files.push_back(warm_start_pose_path);
             generated_files.push_back(warm_start_xyz_path);
@@ -1681,6 +1820,40 @@ int main(int argc, char** argv) {
     } else {
         cout << "Warm start disabled; global BA will start from the direct pose seed" << endl;
     }
+
+    // 3.4 Interpolate gap-frame poses from observed-frame poses (path B).
+    {
+        vector<array<double, 6>> gap_poses;
+        interpolate_gap_poses(frame_numbers, poses, gap_frames, gap_poses);
+
+        for (size_t i = 0; i < gap_frames.size(); i++) {
+            frame_numbers.push_back(gap_frames[i]);
+            poses.push_back(gap_poses[i]);
+        }
+
+        // Sort merged list by frame number.
+        vector<size_t> idx(frame_numbers.size());
+        iota(idx.begin(), idx.end(), 0);
+        sort(idx.begin(), idx.end(),
+             [&](size_t a, size_t b){ return frame_numbers[a] < frame_numbers[b]; });
+        vector<long long> fn_sorted(frame_numbers.size());
+        vector<array<double, 6>> poses_sorted(poses.size());
+        for (size_t i = 0; i < idx.size(); i++) {
+            fn_sorted[i]    = frame_numbers[idx[i]];
+            poses_sorted[i] = poses[idx[i]];
+        }
+        frame_numbers = std::move(fn_sorted);
+        poses         = std::move(poses_sorted);
+
+        if (!gap_frames.empty()) {
+            cout << "Merged " << gap_frames.size()
+                 << " spline-interpolated gap frames; total frames: "
+                 << frame_numbers.size() << endl;
+        }
+    }
+
+    // Record which frames are gap frames (used by save_restored_3d_points).
+    unordered_set<long long> gap_frame_set(gap_frames.begin(), gap_frames.end());
 
     auto poses_before_ba = poses; // Sanity check that global BA actually updates the trajectory.
 
@@ -1706,12 +1879,12 @@ int main(int argc, char** argv) {
 
     const string pose_output_path = join_path(
         results_dir,
-        use_motion_track ? "pose_rigid_with_motion.csv" : "pose_rigid_no_motion.csv");
+        use_motion_track ? "pose_with_motion.csv" : "pose_no_motion.csv");
     const string xyz_output_path = join_path(
         results_dir,
-        use_motion_track ? "xyz_rigid_with_motion.csv" : "xyz_rigid_no_motion.csv");
+        use_motion_track ? "xyz_with_motion.csv" : "xyz_no_motion.csv");
 
-    save_poses(pose_output_path, frame_numbers, poses, fps);
+    save_poses(pose_output_path, frame_numbers, poses, fps, use_motion_track);
     save_3d_points(xyz_output_path, frame_numbers, poses, model_obj, part_order, fps);
     generated_files.push_back(pose_output_path);
     generated_files.push_back(xyz_output_path);
@@ -1720,7 +1893,8 @@ int main(int argc, char** argv) {
         results_dir,
         use_motion_track ? "xyz_restored_with_motion.csv" : "xyz_restored_no_motion.csv");
     save_restored_3d_points(restored_output_path, obs_by_frame, frame_numbers, poses,
-                            model_obj, part_order, fps, static_cast<int>(Ps.size()));
+                            model_obj, part_order, fps, static_cast<int>(Ps.size()),
+                            gap_frame_set);
     generated_files.push_back(restored_output_path);
 
     if (save_reproj) {
@@ -1744,7 +1918,7 @@ int main(int argc, char** argv) {
         if (use_motion_track) {
             const string track_frame_path = join_path(debug_dir, "track_frame.csv");
             save_track_frame_errors(track_frame_path, frame_numbers, poses,
-                                    motion_track_center_obj, grid_step, fps, use_motion_track);
+                                    motion_track_center_obj, grid_step, fps);
             generated_files.push_back(track_frame_path);
         }
     }
