@@ -2,10 +2,11 @@
 
 This repository contains a compact C++ workflow for rigid-template reconstruction and pose-only bundle adjustment with three fixed cameras.
 
-The project is now split into two executables:
+The project is now split into three executables:
 
 - `generate_rigid_template`: builds a rigid template from multi-frame triangulated samples.
 - `BAmotiontrack`: loads a saved template and optimizes one 6-DoF rigid pose per processed frame.
+- `evaluation_3d`: audits GT against up to four prediction variants: rigid/restored crossed with no-motion/with-motion.
 
 The current code keeps the camera matrices fixed and keeps the template fixed during BA. The optimization variables are only the per-frame rigid poses.
 
@@ -16,8 +17,9 @@ BA_rigid/
 ├── BAmotiontrack.cpp
 ├── CMakeLists.txt
 ├── README.md
+├── evaluation_3d.cpp
 ├── generate_rigid_template.cpp
-└── 3cam_rigid/
+└── 3cam/
     ├── cams.txt
     ├── obs_de_front.csv
     ├── obs_de_side.csv
@@ -31,7 +33,7 @@ BA_rigid/
 - Ceres Solver
 - OpenCV with `core` and `calib3d`
 
-The `CMakeLists.txt` links the same dependency set for both executables.
+The `CMakeLists.txt` links the same dependency set for all executables.
 
 ## Build
 
@@ -52,6 +54,12 @@ Step 2: run bundle adjustment with that template
 
 ```bash
 ./build/BAmotiontrack
+```
+
+Step 3: evaluate final 3D trajectories
+
+```bash
+./build/evaluation_3d
 ```
 
 By default, `BAmotiontrack` runs in evaluation-first mode:
@@ -79,6 +87,9 @@ That means the default dataset can be found when you run from the repository roo
 - `--top <path>`: top-camera observation CSV
 - `--output <path>`: output template CSV, default `mouse_model_obj.csv`
 - `--fps <value>`: frame rate, default `30.0`
+- `--adaptive-k <value>`: MAD multiplier for adaptive reprojection filtering, default `2.5`
+- `--angle-thresh <value>`: minimum triangulation angle in deg, default `10.0`
+- `--outlier-mult <value>`: per-part spatial outlier multiplier, default `3.0`
 - `--help` / `-h`: show help
 
 ### `BAmotiontrack`
@@ -92,12 +103,54 @@ That means the default dataset can be found when you run from the repository roo
 - `--warm-start`: enable per-frame pose warm start, default OFF
 - `--motion-track`: enable motion-track during global BA
 - `--no-motion-track`: disable motion-track
-- `--save-init`: save warm-start pose/xyz analysis under `results/debug/`
-- `--save-reproj`: save final reprojection diagnostics under `results/debug/`
+- `--save-init`: save `init_*` analysis and optional `warm_start_*` analysis under `<outdir>/debug/`
+- `--save-reproj`: save final reprojection diagnostics under `<outdir>/debug/`
 - `--lambda <value>`: motion-track weight, default `1.0`
-- `--grid-step <value>`: virtual grid spacing in mm, default `10.0`
+- `--grid-step <value>` / `--grid_step <value>`: virtual grid spacing in mm, default `10.0`
+- `--mt-center <part>`: optional body part used as the motion-track grid center
 - `--stride <value>`: process every `N`th grouped frame, default `1`
+- `--outdir <path>`: output directory, default `results`
 - `--help` / `-h`: show help
+
+### `evaluation_3d`
+
+- `--gt <path>`: GT trajectory CSV, default `xyz_gt.csv`
+- `--rigid-no-motion <path>`: rigid no-motion trajectory CSV, default `results/xyz_rigid_no_motion.csv`
+- `--rigid-with-motion <path>`: rigid with-motion trajectory CSV, default `results/xyz_rigid_with_motion.csv`
+- `--restored-no-motion <path>`: restored no-motion trajectory CSV, default `results/xyz_restored_no_motion.csv`
+- `--restored-with-motion <path>`: restored with-motion trajectory CSV, default `results/xyz_restored_with_motion.csv`
+- `--no-motion <path>`: compatibility alias for `--restored-no-motion`
+- `--motion <path>` / `--with-motion <path>`: compatibility aliases for `--restored-with-motion`
+- `--outdir <path>` / `--output-dir <path>`: output directory for evaluation CSVs and plots, default `results`
+- `--obs-front <path>`: front-camera observation CSV for observation-missing visualization, default `3cam/obs_de_front.csv`
+- `--obs-side <path>`: side-camera observation CSV for observation-missing visualization, default `3cam/obs_de_side.csv`
+- `--obs-top <path>`: top-camera observation CSV for observation-missing visualization, default `3cam/obs_de_top.csv`
+- `--fps <value>`: FPS used when observation CSVs need `t -> frame` conversion, default `30.0`
+- `--missing-start <frame>`: optional missing-window start frame
+- `--missing-end <frame>`: optional missing-window end frame
+- `--help` / `-h`: show help
+
+The evaluator is GT-driven:
+
+- it iterates over GT `(frame, part)` keys,
+- records `matched`, `missing_prediction`, and diagnostic `extra_prediction` cases,
+- reports `matched_rmse_3d`, `coverage`, `missing_rate`, and `penalized_rmse_3d`,
+- computes the missing-point penalty automatically as `0.7 * GT body scale` from the GT bounding box,
+- uses a robust frame high-error threshold `max(median + 3 * MAD, 10mm)`,
+- and writes point/frame/segment audit tables for error analysis, including segment-level part summaries with separate missing/error counts.
+
+In addition, when the three observation CSVs are available, it writes a separate observation-level missing visualization module:
+
+- `obs_camera_summary.csv`: per-frame front/side/top coverage and missing-part counts
+- `obs_missing_per_part.csv`: per-frame, per-camera, per-part missing mask
+- `camera_coverage_vs_time.png`: camera-level coverage curves with bottom `Time (s)` and top `Frame`
+- `camera_missing_count_vs_time.png`: camera-level missing-count curves with the same dual x-axis
+- `front_missing_heatmap.png`, `side_missing_heatmap.png`, `top_missing_heatmap.png`: per-camera missing heatmaps across frames and body parts
+
+This observation module is diagnostic only. It does not change the 3D `coverage` metric reported by the GT-driven evaluator.
+
+It accepts the requested `frame,t,part,X,Y,Z` layout and the current repository GT header `frame,time,part,x_r,y_r,z_r`.
+If `results/xyz_restored_with_motion.csv` is absent, the evaluator also accepts the legacy path `results/xyz_restored_motion.csv`.
 
 ## Input format
 
@@ -109,7 +162,7 @@ The code reads the first three valid lines. Each valid line must contain 12 numb
 
 Each camera CSV must contain at least `t`, `part`, `x`, and `y`.
 
-Supported formats:
+Expected format:
 
 ```csv
 t,part,x,y
@@ -117,22 +170,15 @@ t,part,x,y
 0.033333,left_ear,198.23,156.78
 ```
 
-```csv
-frame,t,part,x,y
-0,0.000000,nose,245.67,189.34
-0,0.000000,left_ear,198.23,156.78
-```
-
 Fields:
 
-- `frame`: optional explicit frame index
 - `t`: timestamp in seconds
 - `part`: body-part name
 - `x`, `y`: 2D image coordinates
 
 ### Template CSV
 
-`BAmotiontrack` expects a centered rigid template with this header:
+`BAmotiontrack` expects a head-centered, body-axis aligned rigid template with this header:
 
 ```csv
 part,X,Y,Z
@@ -146,9 +192,7 @@ The template coordinates are in the object frame, not world coordinates.
 
 ### 1. Load and group observations
 
-The program loads the three camera matrices, loads all observation CSVs, merges them, and groups them by frame.
-
-If the CSV contains an explicit `frame` column, that value is used directly. Otherwise the code falls back to:
+The program loads the three camera matrices, loads all observation CSVs, merges them, and groups them by frame using:
 
 ```text
 frame = round(t * fps)
@@ -156,14 +200,57 @@ frame = round(t * fps)
 
 ### 2. Collect triangulated samples across frames
 
-For each frame:
+The sample collection is split into two filtering passes.
+
+First pass, for each frame and part:
 
 - group observations by `part`,
 - collect all available camera views for that part,
 - require at least two views,
-- triangulate one world-space 3D point with linear DLT.
+- triangulate one world-space 3D point with linear DLT,
+- reject the sample if its maximum triangulation angle across participating camera pairs is below the default threshold (`10.0` deg),
+- keep the surviving 3D points and their reprojection errors temporarily in world coordinates.
 
-The program stores these world-space 3D candidates in:
+After that first pass, the code estimates an adaptive reprojection threshold from all geometry-filtered candidates:
+
+```text
+sigma_hat = MAD(reproj_error - median(reproj_error)) / 0.6745
+reproj_thresh = median(reproj_error) + adaptive_k * sigma_hat
+```
+
+Here:
+
+- `MAD` is the median absolute deviation of the reprojection errors around their median.
+- `0.6745` is the Gaussian consistency constant. For a normal distribution, `MAD = 0.67448975... * sigma`, so dividing by `0.6745` converts `MAD` into a robust standard-deviation-scale estimate `sigma_hat`.
+- `adaptive_k` is a tunable threshold factor, not a fixed statistical constant. The default `2.5` is an engineering tradeoff between over-rejecting valid samples and letting high-error samples through.
+- smaller `adaptive_k` values such as `2.0` are stricter and reject more samples,
+- `adaptive_k = 2.5` is the current default and a balanced setting,
+- larger values such as `3.0` are looser and keep more high-error samples.
+
+If the MAD estimate degenerates, the code falls back to a median-based threshold instead of forcing an over-tight cutoff.
+
+Second pass, per frame:
+
+- reject points whose mean reprojection error is above the adaptive threshold,
+- require `head center` and `tail base`,
+- choose a left-right reference from ears first, then front paws, then hind paws,
+- set the frame origin to `head center`,
+- define the body y-axis as `head center -> tail base`,
+- orthogonalize the left-right reference to obtain a consistent x-axis,
+- compute the z-axis from the cross product,
+- transform every accepted point into the frame-aligned body-local coordinates:
+
+```text
+origin = head_center
+y_axis = normalize(tail_base - head_center)
+X_local = [
+  dot(X_world - origin, x_axis),
+  dot(X_world - origin, y_axis),
+  dot(X_world - origin, z_axis)
+]
+```
+
+The program stores these body-aligned local 3D candidates in:
 
 ```text
 part_samples[part] -> [X_1, X_2, ..., X_K]
@@ -171,7 +258,16 @@ part_samples[part] -> [X_1, X_2, ..., X_K]
 
 ### 3. Aggregate each part robustly
 
-For each part, the current implementation computes a coordinate-wise median:
+For each part, the program first applies a spatial outlier filter in the body-aligned local sample cloud:
+
+- compute a provisional coordinate-wise median center,
+- compute the Euclidean distance from every sample to that center,
+- compute the median of those distances,
+- estimate a robust spread from the distance MAD,
+- keep samples within `median_distance + 3.0 * sigma_distance`,
+- if the MAD estimate degenerates, keep the original samples instead of over-filtering.
+
+After that filtering stage, it computes the final coordinate-wise median:
 
 ```text
 X_final = median({X_t})
@@ -179,25 +275,20 @@ Y_final = median({Y_t})
 Z_final = median({Z_t})
 ```
 
-This produces one aggregated world-space point per part.
+This produces one aggregated body-aligned local point per part.
 
-### 4. Center the template
+### 4. Final template cleanup
 
-After aggregation, the program computes the centroid of all valid part points:
-
-```text
-C = mean of all aggregated part points
-```
-
-and converts the template into object coordinates:
-
-```text
-X_obj = X_world - C
-```
+No final centroid recenter is applied. The template remains head-centered and body-axis aligned.
 
 ### 5. Save the template
 
-The centered template is written to `mouse_model_obj.csv` by default.
+The resulting template is written to `mouse_model_obj.csv` by default, and rows are saved in the fixed `part_order` derived from the input observations.
+
+The program also writes an interactive Plotly skeleton view with the same basename and a `.html` extension, for example:
+
+- `mouse_model_obj.csv`
+- `mouse_model_obj.html`
 
 ## How `BAmotiontrack` works
 
@@ -207,7 +298,7 @@ The BA program loads the camera matrices, loads the three observation CSVs, grou
 
 ### 2. Estimate an initial translation seed
 
-Because the template is already centered in object coordinates, the BA no longer receives a world-space centroid from template creation. Instead, it triangulates the available parts in the earliest grouped frame and uses their centroid as the initial translation seed for pose initialization.
+Because the template origin is `head center`, the BA triangulates `head center` in the earliest grouped frame and uses that world-space position as the initial translation seed.
 
 ### 3. Per-frame pose initialization
 
@@ -291,7 +382,8 @@ The code does not optimize independent 3D point variables per frame.
 
 ### `generate_rigid_template`
 
-- `mouse_model_obj.csv`: centered rigid template
+- `mouse_model_obj.csv`: head-centered, body-axis aligned rigid template
+- `mouse_model_obj.html`: interactive Plotly 3D skeleton view of the final template
 
 ### `BAmotiontrack`
 
@@ -301,12 +393,18 @@ If motion-track is OFF:
 
 - `results/pose_rigid_no_motion.csv`
 - `results/xyz_rigid_no_motion.csv`
+- `results/xyz_restored_no_motion.csv`
 
 If motion-track is ON:
 
 - `results/pose_rigid_with_motion.csv`
 - `results/xyz_rigid_with_motion.csv`
-- `results/xyz_restored.csv`
+- `results/xyz_restored_motion.csv`
+
+Optional initialization analysis, when `--save-init` is used:
+
+- `results/debug/init_pose.csv`
+- `results/debug/init_xyz.csv`
 
 Optional warm-start analysis, only when `--warm-start --save-init` is used:
 
@@ -323,7 +421,35 @@ Optional motion-track debug output, only when `--motion-track --save-reproj` is 
 
 - `results/debug/track_frame.csv`
 
-## `xyz_restored.csv`
+### `evaluation_3d`
+
+Default evaluation outputs are written under `results/`:
+
+- `results/eval_3d_overall.csv`
+- `results/eval_3d_frame.csv`
+- `results/eval_3d_frame_audit.csv`
+- `results/eval_3d_part.csv`
+- `results/eval_3d_point_audit.csv`
+- `results/eval_3d_segment.csv`
+- `results/eval_3d_segment_audit.csv`
+- `results/rmse_3d_vs_time_rigid.png`
+- `results/rmse_3d_vs_time_restored.png`
+- `results/coverage_vs_time_rigid.png`
+- `results/coverage_vs_time_restored.png`
+- `results/penalized_rmse_3d_vs_time_rigid.png`
+- `results/penalized_rmse_3d_vs_time_restored.png`
+- `results/rmse_3d_per_part.png`
+- `results/segment_summary_rigid.png`
+- `results/segment_summary_restored.png`
+- `results/obs_camera_summary.csv`
+- `results/obs_missing_per_part.csv`
+- `results/camera_coverage_vs_time.png`
+- `results/camera_missing_count_vs_time.png`
+- `results/front_missing_heatmap.png`
+- `results/side_missing_heatmap.png`
+- `results/top_missing_heatmap.png`
+
+## `xyz_restored_*.csv`
 
 Header:
 
@@ -331,7 +457,7 @@ Header:
 frame,t,part,X,Y,Z,restored,num_obs
 ```
 
-For every processed frame and every part present in the template, the program:
+For every processed frame and every part present in the template, the program writes the same restored CSV format for both no-motion and motion-track runs:
 
 1. reconstructs the final 3D point from the fixed template and final pose,
 2. counts how many original 2D observations that `frame-part` pair had,
@@ -348,12 +474,15 @@ Current rule with three cameras:
 - one rigid object pose per processed frame
 - the BA keeps camera matrices fixed
 - the BA keeps the rigid template fixed
-- template generation aggregates raw triangulated world-space samples directly, without per-frame pose alignment
+- template generation uses multi-frame triangulation with reprojection filtering, triangulation-angle filtering, head-centered frame-wise body-axis alignment, and per-part spatial outlier filtering
+- by default the exported template remains head-centered and body-axis aligned, without final centroid recenter
+- the BA initial translation seed is estimated from `head center` only
+- motion-track uses the template centroid as its default grid center, unless `--mt-center` is provided
 - warm start is optional and off by default unless `--warm-start` is provided
 - motion-track is optional and off by default unless `--motion-track` is provided
 - reprojection diagnostics are auxiliary and are only written when explicitly requested
 
-Because template generation aggregates world-space triangulations directly, it is best suited to cases where pose variation is limited or where that approximation is acceptable for the intended experiment.
+Because template generation uses a head-centered body frame with a head-to-tail principal axis and a left-right reference, it removes translation and a large part of the pose variation without requiring iterative rigid registration. It is still a single-frame analytic alignment rather than a full template-registration pipeline.
 
 ## Suggested experiments
 
