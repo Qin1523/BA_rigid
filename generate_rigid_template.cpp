@@ -902,9 +902,7 @@ vector<array<double, 3>> filter_spatial_outliers(
 TriangulationPassResult triangulate_all(
     const map<long long, vector<Obs2>>& obs_by_frame,
     const vector<cv::Mat>& Ps,
-    double angle_thresh_deg,
-    double bbox_min,
-    double bbox_max) {
+    double angle_thresh_deg) {
 
     TriangulationPassResult result;
     vector<cv::Point3d> camera_centers;
@@ -929,13 +927,6 @@ TriangulationPassResult triangulate_all(
 
             cv::Point3d X = triangulate_DLT(kv.second, Ps);
             if (!std::isfinite(X.x) || !std::isfinite(X.y) || !std::isfinite(X.z)) {
-                stats.rejected_invalid++;
-                continue;
-            }
-
-            if (X.x < bbox_min || X.x > bbox_max ||
-                X.y < bbox_min || X.y > bbox_max ||
-                X.z < bbox_min || X.z > bbox_max) {
                 stats.rejected_invalid++;
                 continue;
             }
@@ -1244,10 +1235,8 @@ int main(int argc, char** argv) {
     }
 
     cout << "\nStep 2: Triangulating with geometry filtering..." << endl;
-    const double bbox_min = -100.0;
-    const double bbox_max = 650.0;
     TriangulationPassResult triangulation =
-        triangulate_all(obs_by_frame, Ps, angle_thresh_deg, bbox_min, bbox_max);
+        triangulate_all(obs_by_frame, Ps, angle_thresh_deg);
     if (triangulation.samples.empty()) {
         cerr << "ERROR: No triangulated candidates survived geometry filtering" << endl;
         return -1;
