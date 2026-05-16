@@ -1106,7 +1106,7 @@ int main(int argc, char** argv) {
     string front_csv = "3cam/obs_de_front.csv";
     string side_csv = "3cam/obs_de_side.csv";
     string top_csv = "3cam/obs_de_top.csv";
-    string output_path = "mouse_model_obj.csv";
+    string output_path = "results/mouse_model_obj.csv";
     double fps = 30.0;
     double reproj_thresh_px = 3.0;
     double angle_thresh_deg = 5.0;
@@ -1142,7 +1142,7 @@ int main(int argc, char** argv) {
             cout << "  --front <path>      Front camera CSV (default: 3cam/obs_de_front.csv)\n";
             cout << "  --side <path>       Side camera CSV (default: 3cam/obs_de_side.csv)\n";
             cout << "  --top <path>        Top camera CSV (default: 3cam/obs_de_top.csv)\n";
-            cout << "  --output <path>     Output template CSV (default: mouse_model_obj.csv)\n";
+            cout << "  --output <path>     Output template CSV (default: results/mouse_model_obj.csv)\n";
             cout << "  --fps <value>       Frame rate (default: 30.0)\n";
             cout << "  --reproj-thresh <value>   Mean reprojection threshold in px (default: 3.0)\n";
             cout << "  --angle-thresh <value>    Minimum triangulation angle in deg (default: 5.0)\n";
@@ -1158,7 +1158,6 @@ int main(int argc, char** argv) {
     front_csv = resolve_input_path(front_csv, executable_dir);
     side_csv = resolve_input_path(side_csv, executable_dir);
     top_csv = resolve_input_path(top_csv, executable_dir);
-
     cout << "\n=== Generate Rigid Template ===\n" << endl;
     cout << "FPS: " << fps << endl;
     cout << "Resolved cameras: " << cams_path << endl;
