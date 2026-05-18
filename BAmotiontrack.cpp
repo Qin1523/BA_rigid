@@ -830,7 +830,7 @@ void initialize_pose_per_frame(
 // 5) Global BA refinement
 // ============================================================================
 
-void global_bundle_adjustment(
+ceres::Solver::Summary global_bundle_adjustment(
     map<long long, vector<Obs2>>& obs_by_frame,
     const unordered_map<string, array<double, 3>>& model_obj,
     const vector<cv::Mat>& Ps,
@@ -898,6 +898,7 @@ void global_bundle_adjustment(
     ceres::Solve(options, &prob, &summary);
 
     cout << summary.BriefReport() << endl;
+    return summary;
 }
 
 // ============================================================================
@@ -1275,65 +1276,28 @@ void save_poses(const string& path,
                 const vector<long long>& frame_numbers,
                 const vector<array<double, 6>>& poses,
                 double fps,
-                bool use_motion_track) {
+                bool use_motion_track,
+                const unordered_set<long long>& gap_frame_set) {
     ofstream ofs(path);
     if (!ofs.is_open()) {
         cerr << "ERROR: Cannot write " << path << endl;
         return;
     }
 
-    ofs << "frame,t,rx,ry,rz,tx,ty,tz,motion_track\n";
+    ofs << "frame,t,rx,ry,rz,tx,ty,tz,motion_track,restored\n";
 
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
         double t = fr / fps;
+        int restored_flag = gap_frame_set.count(fr) ? 2 : 0;
         ofs << fr << "," << t << ","
             << poses[i][0] << "," << poses[i][1] << "," << poses[i][2] << ","
             << poses[i][3] << "," << poses[i][4] << "," << poses[i][5] << ","
-            << (use_motion_track ? 1 : 0) << "\n";
+            << (use_motion_track ? 1 : 0) << ","
+            << restored_flag << "\n";
     }
 
     cout << "Saved poses to " << path << endl;
-}
-
-void save_3d_points(const string& path,
-                    const vector<long long>& frame_numbers,
-                    const vector<array<double, 6>>& poses,
-                    const unordered_map<string, array<double, 3>>& model_obj,
-                    const vector<string>& part_order,
-                    double fps) {
-    ofstream ofs(path);
-    if (!ofs.is_open()) {
-        cerr << "ERROR: Cannot write " << path << endl;
-        return;
-    }
-
-    ofs << "frame,t,part,X,Y,Z\n";
-
-    for (size_t i = 0; i < frame_numbers.size(); i++) {
-        long long fr = frame_numbers[i];
-        double t = fr / fps;
-        const auto& pose = poses[i];
-
-        // Follow part_order to preserve the original CSV order.
-        for (const string& part : part_order) {
-            // Skip parts that were never added to the template.
-            auto it = model_obj.find(part);
-            if (it == model_obj.end()) {
-                continue; // Part not present in the template.
-            }
-
-            const auto& X_obj = it->second;
-
-            array<double, 3> X_world;
-            apply_pose_transform(pose, X_obj, X_world);
-
-            ofs << fr << "," << t << "," << part << ","
-                << X_world[0] << "," << X_world[1] << "," << X_world[2] << "\n";
-        }
-    }
-
-    cout << "Saved 3D points to " << path << " (order preserved)" << endl;
 }
 
 void save_restored_3d_points(
@@ -1403,6 +1367,73 @@ void save_restored_3d_points(
     }
 
     cout << "Saved restored-aware 3D points to " << path << endl;
+}
+
+// Save the list of gap (fully-missing) frame numbers.
+void save_gap_frames(const string& path,
+                     const vector<long long>& gap_frames) {
+    ofstream ofs(path);
+    if (!ofs.is_open()) {
+        cerr << "ERROR: Cannot write " << path << endl;
+        return;
+    }
+    ofs << "frame\n";
+    for (long long fr : gap_frames) {
+        ofs << fr << "\n";
+    }
+    cout << "Saved " << gap_frames.size() << " gap frames to " << path << endl;
+}
+
+void save_ba_summary(const string& path,
+                     const ceres::Solver::Summary& summary,
+                     bool use_motion_track) {
+    ofstream ofs(path);
+    if (!ofs.is_open()) {
+        cerr << "ERROR: Cannot write " << path << endl;
+        return;
+    }
+    ofs << "field,value\n";
+    ofs << "motion_track," << (use_motion_track ? 1 : 0) << "\n";
+    ofs << "initial_cost," << summary.initial_cost << "\n";
+    ofs << "final_cost," << summary.final_cost << "\n";
+    ofs << "num_iterations," << summary.iterations.size() << "\n";
+    ofs << "termination_type," << ceres::TerminationTypeToString(summary.termination_type) << "\n";
+    ofs << "num_residual_blocks," << summary.num_residual_blocks << "\n";
+    ofs << "num_parameter_blocks," << summary.num_parameter_blocks << "\n";
+    cout << "Saved BA summary to " << path << endl;
+}
+
+void save_run_config(const string& path,
+                     double fps,
+                     bool use_warm_start,
+                     bool use_motion_track,
+                     double lambda,
+                     double grid_step,
+                     int frame_stride,
+                     const string& mt_center_part,
+                     double motion_track_body_scale,
+                     size_t num_frames_observed,
+                     size_t num_frames_gap,
+                     size_t num_frames_total) {
+    ofstream ofs(path);
+    if (!ofs.is_open()) {
+        cerr << "ERROR: Cannot write " << path << endl;
+        return;
+    }
+    ofs << "{\n";
+    ofs << "  \"fps\": " << fps << ",\n";
+    ofs << "  \"use_warm_start\": " << (use_warm_start ? "true" : "false") << ",\n";
+    ofs << "  \"use_motion_track\": " << (use_motion_track ? "true" : "false") << ",\n";
+    ofs << "  \"lambda\": " << lambda << ",\n";
+    ofs << "  \"grid_step_mm\": " << grid_step << ",\n";
+    ofs << "  \"frame_stride\": " << frame_stride << ",\n";
+    ofs << "  \"mt_center_part\": \"" << mt_center_part << "\",\n";
+    ofs << "  \"motion_track_body_scale_mm\": " << motion_track_body_scale << ",\n";
+    ofs << "  \"num_frames_observed\": " << num_frames_observed << ",\n";
+    ofs << "  \"num_frames_gap\": " << num_frames_gap << ",\n";
+    ofs << "  \"num_frames_total\": " << num_frames_total << "\n";
+    ofs << "}\n";
+    cout << "Saved run config to " << path << endl;
 }
 
 // ============================================================================
@@ -1517,8 +1548,6 @@ int main(int argc, char** argv) {
     double fps = 30.0;
     bool use_warm_start = false;
     bool use_motion_track = false;   // Motion-track is off unless explicitly enabled.
-    bool save_init = false;
-    bool save_reproj = false;
     double lambda = 1.0;             // Motion-track weight.
     double grid_step = 10.0;         // Virtual grid spacing in mm.
     int frame_stride = 1;            // 1 = use every frame, 2 = use every other frame, etc.
@@ -1534,10 +1563,6 @@ int main(int argc, char** argv) {
             use_motion_track = true;
         } else if (arg == "--no-motion-track") {
             use_motion_track = false;
-        } else if (arg == "--save-init") {
-            save_init = true;
-        } else if (arg == "--save-reproj") {
-            save_reproj = true;
         } else if (arg == "--lambda" && i+1 < argc) {
             lambda = stod(argv[++i]);
         } else if ((arg == "--grid-step" || arg == "--grid_step") && i+1 < argc) {
@@ -1571,8 +1596,6 @@ int main(int argc, char** argv) {
             cout << "  --warm-start        Enable per-frame pose warm start\n";
             cout << "  --motion-track      Enable motion-track constraint\n";
             cout << "  --no-motion-track   Disable motion-track constraint\n";
-            cout << "  --save-init         Save init and optional warm-start pose/xyz analysis under <outdir>/debug/\n";
-            cout << "  --save-reproj       Save final reprojection diagnostics under <outdir>/debug/\ng";
             cout << "  --lambda <value>    Motion-track weight (default: 1.0)\n";
             cout << "  --grid-step <value> Grid step in mm (default: 10.0)\n";
             cout << "  --grid_step <value> Alias for --grid-step\n";
@@ -1594,8 +1617,6 @@ int main(int argc, char** argv) {
     cout << "FPS: " << fps << endl;
     cout << "Warm start: " << (use_warm_start ? "ON" : "OFF") << endl;
     cout << "Motion-track constraint: " << (use_motion_track ? "ON" : "OFF") << endl;
-    cout << "Save init: " << (save_init ? "ON" : "OFF") << endl;
-    cout << "Save reproj: " << (save_reproj ? "ON" : "OFF") << endl;
     if (use_motion_track) {
         cout << "Lambda: " << lambda << ", Grid step: " << grid_step << endl;
     }
@@ -1727,13 +1748,11 @@ int main(int argc, char** argv) {
     }
 
     const string results_dir = output_dir;
-    const string debug_dir = join_path(results_dir, "debug");
+    const string diag_dir = join_path(results_dir, "diagnostics");
     if (!ensure_directory(results_dir)) {
         return -1;
     }
-
-    const bool need_debug_dir = save_init || save_reproj;
-    if (need_debug_dir && !ensure_directory(debug_dir)) {
+    if (!ensure_directory(diag_dir)) {
         return -1;
     }
 
@@ -1751,6 +1770,7 @@ int main(int argc, char** argv) {
         cout << "Detected " << gap_frames.size() << " gap frames (step="
              << frame_step << ")" << endl;
     }
+    unordered_set<long long> gap_frame_set(gap_frames.begin(), gap_frames.end());
 
     // 3.2 Build observed-frame list (with stride).
     vector<long long> frame_numbers;
@@ -1773,13 +1793,11 @@ int main(int argc, char** argv) {
              << " out of " << obs_by_frame.size() << " frames)" << endl;
     }
 
-    if (save_init) {
-        const string init_pose_path = join_path(debug_dir, "init_pose.csv");
-        const string init_xyz_path = join_path(debug_dir, "init_xyz.csv");
-        save_poses(init_pose_path, frame_numbers, poses, fps, use_motion_track);
-        save_3d_points(init_xyz_path, frame_numbers, poses, model_obj, part_order, fps);
+    {
+        const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
+        const string init_pose_path = join_path(diag_dir, "init_pose" + suffix + ".csv");
+        save_poses(init_pose_path, frame_numbers, poses, fps, use_motion_track, gap_frame_set);
         generated_files.push_back(init_pose_path);
-        generated_files.push_back(init_xyz_path);
     }
 
     if (use_warm_start) {
@@ -1803,13 +1821,11 @@ int main(int argc, char** argv) {
 
         cout << "Completed warm start for all frames" << endl;
 
-        if (save_init) {
-            const string warm_start_pose_path = join_path(debug_dir, "warm_start_pose.csv");
-            const string warm_start_xyz_path = join_path(debug_dir, "warm_start_xyz.csv");
-            save_poses(warm_start_pose_path, frame_numbers, poses, fps, use_motion_track);
-            save_3d_points(warm_start_xyz_path, frame_numbers, poses, model_obj, part_order, fps);
+        {
+            const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
+            const string warm_start_pose_path = join_path(diag_dir, "warm_start_pose" + suffix + ".csv");
+            save_poses(warm_start_pose_path, frame_numbers, poses, fps, use_motion_track, gap_frame_set);
             generated_files.push_back(warm_start_pose_path);
-            generated_files.push_back(warm_start_xyz_path);
         }
     } else {
         cout << "Warm start disabled; global BA will start from the direct pose seed" << endl;
@@ -1846,17 +1862,40 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Record which frames are gap frames (used by save_restored_3d_points).
-    unordered_set<long long> gap_frame_set(gap_frames.begin(), gap_frames.end());
-
     auto poses_before_ba = poses; // Sanity check that global BA actually updates the trajectory.
+
+    // Output pre-BA reprojection diagnostics for before/after comparison.
+    {
+        const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
+        const string pre_reproj_frame_path      = join_path(diag_dir, "pre_ba_reproj_frame" + suffix + ".csv");
+        const string pre_reproj_frame_cam_path  = join_path(diag_dir, "pre_ba_reproj_frame_cam" + suffix + ".csv");
+        const string pre_reproj_frame_part_path = join_path(diag_dir, "pre_ba_reproj_frame_part" + suffix + ".csv");
+
+        save_reproj_frame_errors(pre_reproj_frame_path, obs_by_frame, frame_numbers,
+                                 poses, model_obj, Ps, fps);
+        save_reproj_frame_cam_errors(pre_reproj_frame_cam_path, obs_by_frame, frame_numbers,
+                                     poses, model_obj, Ps, fps);
+        save_reproj_frame_part_errors(pre_reproj_frame_part_path, obs_by_frame, frame_numbers,
+                                      poses, model_obj, Ps, fps);
+
+        generated_files.push_back(pre_reproj_frame_path);
+        generated_files.push_back(pre_reproj_frame_cam_path);
+        generated_files.push_back(pre_reproj_frame_part_path);
+    }
 
     // 4) Run the global BA refinement.
     cout << "\nStep 4: Global bundle adjustment..." << endl;
 
-    global_bundle_adjustment(obs_by_frame, model_obj, Ps, poses, frame_numbers,
-                            use_motion_track, lambda, grid_step, motion_track_center_obj,
-                            motion_track_body_scale);
+    ceres::Solver::Summary ba_summary =
+        global_bundle_adjustment(obs_by_frame, model_obj, Ps, poses, frame_numbers,
+                                 use_motion_track, lambda, grid_step, motion_track_center_obj,
+                                 motion_track_body_scale);
+
+    const string ba_summary_path = join_path(
+        diag_dir,
+        use_motion_track ? "ba_summary_with_motion.csv" : "ba_summary_no_motion.csv");
+    save_ba_summary(ba_summary_path, ba_summary, use_motion_track);
+    generated_files.push_back(ba_summary_path);
 
 
     // Report the largest pose change introduced by global BA.
@@ -1871,17 +1910,30 @@ int main(int argc, char** argv) {
     // 5) Save final evaluation outputs.
     cout << "\nStep 5: Saving evaluation outputs..." << endl;
 
+    {
+        const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
+        const string config_path = join_path(results_dir, "run_config" + suffix + ".json");
+        save_run_config(
+            config_path,
+            fps,
+            use_warm_start,
+            use_motion_track,
+            lambda,
+            grid_step,
+            frame_stride,
+            mt_center_part,
+            motion_track_body_scale,
+            obs_by_frame.size(),
+            gap_frames.size(),
+            frame_numbers.size());
+        generated_files.push_back(config_path);
+    }
+
     const string pose_output_path = join_path(
         results_dir,
         use_motion_track ? "pose_with_motion.csv" : "pose_no_motion.csv");
-    const string xyz_output_path = join_path(
-        results_dir,
-        use_motion_track ? "xyz_with_motion.csv" : "xyz_no_motion.csv");
-
-    save_poses(pose_output_path, frame_numbers, poses, fps, use_motion_track);
-    save_3d_points(xyz_output_path, frame_numbers, poses, model_obj, part_order, fps);
+    save_poses(pose_output_path, frame_numbers, poses, fps, use_motion_track, gap_frame_set);
     generated_files.push_back(pose_output_path);
-    generated_files.push_back(xyz_output_path);
 
     const string restored_output_path = join_path(
         results_dir,
@@ -1891,12 +1943,19 @@ int main(int argc, char** argv) {
                             gap_frame_set);
     generated_files.push_back(restored_output_path);
 
-    if (save_reproj) {
-        cout << "\nStep 6: Saving debug diagnostics..." << endl;
+    const string gap_frames_path = join_path(
+        results_dir,
+        use_motion_track ? "gap_frames_with_motion.csv" : "gap_frames_no_motion.csv");
+    save_gap_frames(gap_frames_path, gap_frames);
+    generated_files.push_back(gap_frames_path);
 
-        const string reproj_frame_path = join_path(debug_dir, "reproj_frame.csv");
-        const string reproj_frame_cam_path = join_path(debug_dir, "reproj_frame_cam.csv");
-        const string reproj_frame_part_path = join_path(debug_dir, "reproj_frame_part.csv");
+    {
+        cout << "\nStep 6: Saving diagnostics..." << endl;
+        const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
+
+        const string reproj_frame_path      = join_path(diag_dir, "reproj_frame"      + suffix + ".csv");
+        const string reproj_frame_cam_path  = join_path(diag_dir, "reproj_frame_cam"  + suffix + ".csv");
+        const string reproj_frame_part_path = join_path(diag_dir, "reproj_frame_part" + suffix + ".csv");
 
         save_reproj_frame_errors(reproj_frame_path, obs_by_frame, frame_numbers,
                                  poses, model_obj, Ps, fps);
@@ -1910,7 +1969,7 @@ int main(int argc, char** argv) {
         generated_files.push_back(reproj_frame_part_path);
 
         if (use_motion_track) {
-            const string track_frame_path = join_path(debug_dir, "track_frame.csv");
+            const string track_frame_path = join_path(diag_dir, "track_frame" + suffix + ".csv");
             save_track_frame_errors(track_frame_path, frame_numbers, poses,
                                     motion_track_center_obj, grid_step, fps);
             generated_files.push_back(track_frame_path);
