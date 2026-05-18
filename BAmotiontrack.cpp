@@ -1378,14 +1378,8 @@ void save_restored_3d_points(
 
             const auto& X_obj = model_it->second;
 
-            double X_rot[3];
-            ceres::AngleAxisRotatePoint(pose.data(), X_obj.data(), X_rot);
-
-            double X_world[3] = {
-                X_rot[0] + pose[3],
-                X_rot[1] + pose[4],
-                X_rot[2] + pose[5]
-            };
+            array<double, 3> X_world;
+            apply_pose_transform(pose, X_obj, X_world);
 
             int num_obs = 0;
             auto count_it = part_obs_count.find(part);
