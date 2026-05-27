@@ -1799,9 +1799,10 @@ int main(int argc, char** argv) {
         save_poses(init_pose_path, frame_numbers, poses, fps, use_motion_track, gap_frame_set);
         generated_files.push_back(init_pose_path);
     }
+    // 3.3 warm start
 
     if (use_warm_start) {
-        cout << "\nStep 3.5: Running warm start..." << endl;
+        cout << "\nStep 3.3: Running warm start..." << endl;
         for (size_t i = 0; i < frame_numbers.size(); i++) {
             long long fr = frame_numbers[i];
 
