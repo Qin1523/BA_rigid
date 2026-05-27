@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
+#include <set>
 #include <array>
 #include <cmath>
 #include <algorithm>
@@ -1369,19 +1370,71 @@ void save_restored_3d_points(
     cout << "Saved restored-aware 3D points to " << path << endl;
 }
 
-// Save the list of gap (fully-missing) frame numbers.
-void save_gap_frames(const string& path,
-                     const vector<long long>& gap_frames) {
-    ofstream ofs(path);
+void save_observation_audit(
+    const string& out_path,
+    const map<long long, vector<Obs2>>& obs_by_frame,
+    const unordered_set<long long>& gap_frame_set,
+    const vector<string>& part_order,
+    int num_cams,
+    double fps) {
+
+    static const array<string, 3> cam_name = {"front", "side", "top"};
+
+    ofstream ofs(out_path);
     if (!ofs.is_open()) {
-        cerr << "ERROR: Cannot write " << path << endl;
+        cerr << "ERROR: Cannot write observation audit to " << out_path << endl;
         return;
     }
-    ofs << "frame\n";
-    for (long long fr : gap_frames) {
-        ofs << fr << "\n";
+
+    ofs << "frame_id,time_s,camera,part_name,is_camera_missing\n";
+
+    for (const auto& kv : obs_by_frame) {
+        const long long fr = kv.first;
+        const double time_s = fr / fps;
+        const vector<Obs2>& obs = kv.second;
+
+        set<pair<int, string>> observed_set;
+        for (const auto& ob : obs) {
+            observed_set.insert({ob.cam, ob.part});
+        }
+
+        for (int cam = 0; cam < num_cams; cam++) {
+            bool cam_has_any = false;
+            for (const auto& part : part_order) {
+                if (observed_set.count({cam, part})) {
+                    cam_has_any = true;
+                    break;
+                }
+            }
+            const int is_camera_missing = cam_has_any ? 0 : 1;
+
+            for (const auto& part : part_order) {
+                if (!observed_set.count({cam, part})) {
+                    ofs << fr << ","
+                        << time_s << ","
+                        << cam_name[cam] << ","
+                        << part << ","
+                        << is_camera_missing << "\n";
+                }
+            }
+        }
     }
-    cout << "Saved " << gap_frames.size() << " gap frames to " << path << endl;
+
+    for (const long long fr : gap_frame_set) {
+        if (obs_by_frame.count(fr)) continue;
+        const double time_s = fr / fps;
+        for (int cam = 0; cam < num_cams; cam++) {
+            for (const auto& part : part_order) {
+                ofs << fr << ","
+                    << time_s << ","
+                    << cam_name[cam] << ","
+                    << part << ","
+                    << 1 << "\n";
+            }
+        }
+    }
+
+    cout << "Saved observation audit to " << out_path << endl;
 }
 
 void save_ba_summary(const string& path,
@@ -1772,6 +1825,16 @@ int main(int argc, char** argv) {
     }
     unordered_set<long long> gap_frame_set(gap_frames.begin(), gap_frames.end());
 
+    // Observation quality audit - run once, independent of with/no_motion.
+    {
+        const string audit_path = join_path(output_dir, "anomaly_missing_obs.csv");
+        if (!file_exists(audit_path)) {
+            save_observation_audit(audit_path, obs_by_frame, gap_frame_set,
+                                   part_order, 3, fps);
+            generated_files.push_back(audit_path);
+        }
+    }
+
     // 3.2 Build observed-frame list (with stride).
     vector<long long> frame_numbers;
     vector<array<double, 6>> poses;
@@ -1794,10 +1857,11 @@ int main(int argc, char** argv) {
     }
 
     {
-        const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
-        const string init_pose_path = join_path(diag_dir, "init_pose" + suffix + ".csv");
-        save_poses(init_pose_path, frame_numbers, poses, fps, use_motion_track, gap_frame_set);
-        generated_files.push_back(init_pose_path);
+        const string init_pose_path = join_path(diag_dir, "init_pose.csv");
+        if (!file_exists(init_pose_path)) {
+            save_poses(init_pose_path, frame_numbers, poses, fps, false, gap_frame_set);
+            generated_files.push_back(init_pose_path);
+        }
     }
     // 3.3 warm start
 
@@ -1867,21 +1931,21 @@ int main(int argc, char** argv) {
 
     // Output pre-BA reprojection diagnostics for before/after comparison.
     {
-        const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
-        const string pre_reproj_frame_path      = join_path(diag_dir, "pre_ba_reproj_frame" + suffix + ".csv");
-        const string pre_reproj_frame_cam_path  = join_path(diag_dir, "pre_ba_reproj_frame_cam" + suffix + ".csv");
-        const string pre_reproj_frame_part_path = join_path(diag_dir, "pre_ba_reproj_frame_part" + suffix + ".csv");
+        const string pre_reproj_frame_path      = join_path(diag_dir, "pre_ba_reproj_frame.csv");
+        const string pre_reproj_frame_cam_path  = join_path(diag_dir, "pre_ba_reproj_frame_cam.csv");
+        const string pre_reproj_frame_part_path = join_path(diag_dir, "pre_ba_reproj_frame_part.csv");
 
-        save_reproj_frame_errors(pre_reproj_frame_path, obs_by_frame, frame_numbers,
-                                 poses, model_obj, Ps, fps);
-        save_reproj_frame_cam_errors(pre_reproj_frame_cam_path, obs_by_frame, frame_numbers,
+        if (!file_exists(pre_reproj_frame_path)) {
+            save_reproj_frame_errors(pre_reproj_frame_path, obs_by_frame, frame_numbers,
                                      poses, model_obj, Ps, fps);
-        save_reproj_frame_part_errors(pre_reproj_frame_part_path, obs_by_frame, frame_numbers,
-                                      poses, model_obj, Ps, fps);
-
-        generated_files.push_back(pre_reproj_frame_path);
-        generated_files.push_back(pre_reproj_frame_cam_path);
-        generated_files.push_back(pre_reproj_frame_part_path);
+            save_reproj_frame_cam_errors(pre_reproj_frame_cam_path, obs_by_frame, frame_numbers,
+                                         poses, model_obj, Ps, fps);
+            save_reproj_frame_part_errors(pre_reproj_frame_part_path, obs_by_frame, frame_numbers,
+                                          poses, model_obj, Ps, fps);
+            generated_files.push_back(pre_reproj_frame_path);
+            generated_files.push_back(pre_reproj_frame_cam_path);
+            generated_files.push_back(pre_reproj_frame_part_path);
+        }
     }
 
     // 4) Run the global BA refinement.
@@ -1943,12 +2007,6 @@ int main(int argc, char** argv) {
                             model_obj, part_order, fps, static_cast<int>(Ps.size()),
                             gap_frame_set);
     generated_files.push_back(restored_output_path);
-
-    const string gap_frames_path = join_path(
-        results_dir,
-        use_motion_track ? "gap_frames_with_motion.csv" : "gap_frames_no_motion.csv");
-    save_gap_frames(gap_frames_path, gap_frames);
-    generated_files.push_back(gap_frames_path);
 
     {
         cout << "\nStep 6: Saving diagnostics..." << endl;
