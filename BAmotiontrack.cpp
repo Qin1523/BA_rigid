@@ -690,6 +690,26 @@ private:
 
 // Four-point cubic interpolation used to predict the center frame from
 // t-2, t-1, t+1, and t+2.
+// Four-point cubic interpolation (not-a-knot spline) used to predict the
+// center frame from t-2, t-1, t+1, and t+2 (leave-one-out at t=0).
+//
+// Sample times: x0=-2, x1=-1, x2=+1, x3=+2  (t=0 is the prediction target).
+//
+// Not-a-knot condition: the cubic on [-2,-1] and [-1,0) shares its third
+// derivative with the cubic on [-1,+1], and similarly at the right end.
+// For four equally-spaced-but-gapped points the weights at t=0 are derived
+// by solving the 2x2 tridiagonal system for the interior knot moments, then
+// evaluating the resulting piecewise polynomial at t=0.
+//
+// Derivation summary (h_left=1, h_gap=1, h_right=1, gap from -1 to +1 = 2):
+//   Segments: s0=[-2,-1], s1=[-1,+1], s2=[+1,+2]
+//   Not-a-knot: M0=M1 (left), M2=M3 (right), where M_i are second derivatives.
+//   Interior unknowns: M1, M2.  System:
+//     4*M1 + 2*M2 = 3*(y2-y1)/h1^2 - 3*(y1-y0)/h0^2   [knot at x=-1]
+//     2*M1 + 4*M2 = 3*(y3-y2)/h2^2 - 3*(y2-y1)/h1^2   [knot at x=+1]
+//   with h0=h2=1, h1=2, y0=p_m2, y1=p_m1, y2=p_p1, y3=p_p2.
+//   Solving and evaluating s1 at t=0 (local coordinate dt=0-(-1)=1 into s1):
+//     result = -1/8*p_m2 + 5/8*p_m1 + 5/8*p_p1 - 1/8*p_p2
 template <typename T>
 void cubic_spline_predict_center(const T* p_m2, const T* p_m1,
                                   const T* p_p1, const T* p_p2,
@@ -701,10 +721,17 @@ void cubic_spline_predict_center(const T* p_m2, const T* p_m1,
     // l2(0) = (0-(-2))*(0-(-1))*(0-2) / (1-(-2))*(1-(-1))*(1-2) = 2*1*(-2)/(3*2*(-1)) = -4/(-6) = 2/3
     // l3(0) = (0-(-2))*(0-(-1))*(0-1) / (2-(-2))*(2-(-1))*(2-1) = 2*1*(-1)/(4*3*1) = -2/12 = -1/6
 
-    T w0 = T(-1.0/6.0);
-    T w1 = T(2.0/3.0);
-    T w2 = T(2.0/3.0);
-    T w3 = T(-1.0/6.0);
+    // T w0 = T(-1.0/6.0);
+    // T w1 = T(2.0/3.0);
+    // T w2 = T(2.0/3.0);
+    // T w3 = T(-1.0/6.0);
+
+    // Not-a-knot spline weights at t=0 for nodes at {-2,-1,+1,+2}.
+    const T w0 = T(-1.0 / 8.0);
+    const T w1 = T( 5.0 / 8.0);
+    const T w2 = T( 5.0 / 8.0);
+    const T w3 = T(-1.0 / 8.0);
+
 
     for (int i = 0; i < dim; i++) {
         result[i] = w0 * p_m2[i] + w1 * p_m1[i] + w2 * p_p1[i] + w3 * p_p2[i];
@@ -944,8 +971,8 @@ struct ReprojError {
 
 struct TrackErrorStats {
     double rmse;
-    double mean_abs;
-    double max_abs;
+    double translation_error_mm;  // ||t_actual - t_pred||
+    double rotation_error_deg;    // angle between R_actual and R_pred
 };
 
 ReprojError compute_reproj_error(const cv::Mat& P,
@@ -1028,18 +1055,82 @@ TrackErrorStats compute_track_error_for_frame(
         return stats;
     }
 
-    double sum = 0.0;
     double sum_sq = 0.0;
-    double max_err = 0.0;
     for (double e : point_errors) {
-        sum += e;
         sum_sq += e * e;
-        if (e > max_err) max_err = e;
+    }
+    stats.rmse = sqrt(sum_sq / point_errors.size());
+
+    // Translation error: Euclidean distance between actual and predicted translation.
+    {
+        double dx = pose_0[3] - pose_spline[3];
+        double dy = pose_0[4] - pose_spline[4];
+        double dz = pose_0[5] - pose_spline[5];
+        stats.translation_error_mm = sqrt(dx*dx + dy*dy + dz*dz);
     }
 
-    stats.rmse = sqrt(sum_sq / point_errors.size());
-    stats.mean_abs = sum / point_errors.size();
-    stats.max_abs = max_err;
+    // Rotation error: angle of the relative rotation R_pred^T * R_actual.
+    // R_rel = R_pred^{-1} * R_actual  =>  angle-axis of R_rel gives the rotation angle.
+    {
+        // Convert both angle-axis vectors to rotation matrices, then compute
+        // R_rel = R_pred^T * R_actual, then extract the rotation angle.
+        // Using Rodrigues: R_rel's angle satisfies cos(theta) = (trace(R_rel) - 1) / 2.
+
+        // Build R_actual from pose_0[0..2].
+        double R_actual[9], R_pred[9];
+
+        {
+            double aa[3] = {pose_0[0], pose_0[1], pose_0[2]};
+            // AngleAxisToRotationMatrix: column-major in Ceres convention.
+            // We use the manual Rodrigues formula to stay dependency-free.
+            double angle = sqrt(aa[0]*aa[0] + aa[1]*aa[1] + aa[2]*aa[2]);
+            if (angle < 1e-10) {
+                // Identity
+                R_actual[0]=1; R_actual[1]=0; R_actual[2]=0;
+                R_actual[3]=0; R_actual[4]=1; R_actual[5]=0;
+                R_actual[6]=0; R_actual[7]=0; R_actual[8]=1;
+            } else {
+                double kx=aa[0]/angle, ky=aa[1]/angle, kz=aa[2]/angle;
+                double c=cos(angle), s=sin(angle), t1=1-c;
+                R_actual[0]=t1*kx*kx+c;    R_actual[1]=t1*kx*ky-s*kz; R_actual[2]=t1*kx*kz+s*ky;
+                R_actual[3]=t1*kx*ky+s*kz; R_actual[4]=t1*ky*ky+c;    R_actual[5]=t1*ky*kz-s*kx;
+                R_actual[6]=t1*kx*kz-s*ky; R_actual[7]=t1*ky*kz+s*kx; R_actual[8]=t1*kz*kz+c;
+            }
+        }
+
+        {
+            double aa[3] = {pose_spline[0], pose_spline[1], pose_spline[2]};
+            double angle = sqrt(aa[0]*aa[0] + aa[1]*aa[1] + aa[2]*aa[2]);
+            if (angle < 1e-10) {
+                R_pred[0]=1; R_pred[1]=0; R_pred[2]=0;
+                R_pred[3]=0; R_pred[4]=1; R_pred[5]=0;
+                R_pred[6]=0; R_pred[7]=0; R_pred[8]=1;
+            } else {
+                double kx=aa[0]/angle, ky=aa[1]/angle, kz=aa[2]/angle;
+                double c=cos(angle), s=sin(angle), t1=1-c;
+                R_pred[0]=t1*kx*kx+c;    R_pred[1]=t1*kx*ky-s*kz; R_pred[2]=t1*kx*kz+s*ky;
+                R_pred[3]=t1*kx*ky+s*kz; R_pred[4]=t1*ky*ky+c;    R_pred[5]=t1*ky*kz-s*kx;
+                R_pred[6]=t1*kx*kz-s*ky; R_pred[7]=t1*ky*kz+s*kx; R_pred[8]=t1*kz*kz+c;
+            }
+        }
+
+        // R_rel = R_pred^T * R_actual  (row-major: R[row*3+col])
+        double trace = 0.0;
+        for (int r = 0; r < 3; r++) {
+            for (int c2 = 0; c2 < 3; c2++) {
+                // R_rel[r][c2] = sum_k R_pred[k][r] * R_actual[k][c2]
+                //              = sum_k R_pred[k*3+r] * R_actual[k*3+c2]
+                double val = 0.0;
+                for (int k = 0; k < 3; k++) val += R_pred[k*3+r] * R_actual[k*3+c2];
+                if (r == c2) trace += val;
+            }
+        }
+
+        double cos_theta = (trace - 1.0) / 2.0;
+        cos_theta = max(-1.0, min(1.0, cos_theta));  // clamp for numerical safety
+        stats.rotation_error_deg = acos(cos_theta) * (180.0 / M_PI);
+    }
+
     return stats;
 }
 
@@ -1249,7 +1340,7 @@ void save_track_frame_errors(
         return;
     }
 
-    ofs << "frame,t,track_rmse_mm,track_mean_abs_mm,track_max_abs_mm\n";
+    ofs << "frame,t,track_rmse_mm,track_translation_mm,track_rotation_deg\n";
 
     // Only middle frames have a full five-frame neighborhood.
     for (size_t i = 2; i + 2 < frame_numbers.size(); i++) {
@@ -1262,8 +1353,8 @@ void save_track_frame_errors(
 
         ofs << fr << "," << t << ","
             << stats.rmse << ","
-            << stats.mean_abs << ","
-            << stats.max_abs << "\n";
+            << stats.translation_error_mm << ","
+            << stats.rotation_error_deg << "\n";
     }
 
     cout << "Saved motion-track errors (per frame) to " << path << endl;
@@ -1602,7 +1693,7 @@ int main(int argc, char** argv) {
     bool use_warm_start = false;
     bool use_motion_track = false;   // Motion-track is off unless explicitly enabled.
     double lambda = 1.0;             // Motion-track weight.
-    double grid_step = 10.0;         // Virtual grid spacing in mm.
+    double grid_step = 25.0;         // Virtual grid spacing in mm.
     int frame_stride = 1;            // 1 = use every frame, 2 = use every other frame, etc.
 
     // Parse command-line arguments.
