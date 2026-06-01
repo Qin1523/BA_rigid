@@ -933,6 +933,22 @@ ceres::Solver::Summary global_bundle_adjustment(
 // Helper functions for error evaluation
 // ============================================================================
 
+// Convert an angle-axis vector to a row-major 3x3 rotation matrix (R[row*3+col]).
+void aa_to_rotmat(const double aa[3], double R[9]) {
+    double angle = sqrt(aa[0]*aa[0] + aa[1]*aa[1] + aa[2]*aa[2]);
+    if (angle < 1e-10) {
+        R[0]=1; R[1]=0; R[2]=0;
+        R[3]=0; R[4]=1; R[5]=0;
+        R[6]=0; R[7]=0; R[8]=1;
+        return;
+    }
+    double kx=aa[0]/angle, ky=aa[1]/angle, kz=aa[2]/angle;
+    double c=cos(angle), s=sin(angle), t1=1-c;
+    R[0]=t1*kx*kx+c;    R[1]=t1*kx*ky-s*kz; R[2]=t1*kx*kz+s*ky;
+    R[3]=t1*kx*ky+s*kz; R[4]=t1*ky*ky+c;    R[5]=t1*ky*kz-s*kx;
+    R[6]=t1*kx*kz-s*ky; R[7]=t1*ky*kz+s*kx; R[8]=t1*kz*kz+c;
+}
+
 // Apply a pose transform to a 3D point.
 void apply_pose_transform(const array<double, 6>& pose,
                           const array<double, 3>& X_obj,
@@ -1078,40 +1094,11 @@ TrackErrorStats compute_track_error_for_frame(
 
         // Build R_actual from pose_0[0..2].
         double R_actual[9], R_pred[9];
-
         {
-            double aa[3] = {pose_0[0], pose_0[1], pose_0[2]};
-            // AngleAxisToRotationMatrix: column-major in Ceres convention.
-            // We use the manual Rodrigues formula to stay dependency-free.
-            double angle = sqrt(aa[0]*aa[0] + aa[1]*aa[1] + aa[2]*aa[2]);
-            if (angle < 1e-10) {
-                // Identity
-                R_actual[0]=1; R_actual[1]=0; R_actual[2]=0;
-                R_actual[3]=0; R_actual[4]=1; R_actual[5]=0;
-                R_actual[6]=0; R_actual[7]=0; R_actual[8]=1;
-            } else {
-                double kx=aa[0]/angle, ky=aa[1]/angle, kz=aa[2]/angle;
-                double c=cos(angle), s=sin(angle), t1=1-c;
-                R_actual[0]=t1*kx*kx+c;    R_actual[1]=t1*kx*ky-s*kz; R_actual[2]=t1*kx*kz+s*ky;
-                R_actual[3]=t1*kx*ky+s*kz; R_actual[4]=t1*ky*ky+c;    R_actual[5]=t1*ky*kz-s*kx;
-                R_actual[6]=t1*kx*kz-s*ky; R_actual[7]=t1*ky*kz+s*kx; R_actual[8]=t1*kz*kz+c;
-            }
-        }
-
-        {
-            double aa[3] = {pose_spline[0], pose_spline[1], pose_spline[2]};
-            double angle = sqrt(aa[0]*aa[0] + aa[1]*aa[1] + aa[2]*aa[2]);
-            if (angle < 1e-10) {
-                R_pred[0]=1; R_pred[1]=0; R_pred[2]=0;
-                R_pred[3]=0; R_pred[4]=1; R_pred[5]=0;
-                R_pred[6]=0; R_pred[7]=0; R_pred[8]=1;
-            } else {
-                double kx=aa[0]/angle, ky=aa[1]/angle, kz=aa[2]/angle;
-                double c=cos(angle), s=sin(angle), t1=1-c;
-                R_pred[0]=t1*kx*kx+c;    R_pred[1]=t1*kx*ky-s*kz; R_pred[2]=t1*kx*kz+s*ky;
-                R_pred[3]=t1*kx*ky+s*kz; R_pred[4]=t1*ky*ky+c;    R_pred[5]=t1*ky*kz-s*kx;
-                R_pred[6]=t1*kx*kz-s*ky; R_pred[7]=t1*ky*kz+s*kx; R_pred[8]=t1*kz*kz+c;
-            }
+            double aa_a[3] = {pose_0[0],      pose_0[1],      pose_0[2]};
+            double aa_p[3] = {pose_spline[0], pose_spline[1], pose_spline[2]};
+            aa_to_rotmat(aa_a, R_actual);
+            aa_to_rotmat(aa_p, R_pred);
         }
 
         // R_rel = R_pred^T * R_actual  (row-major: R[row*3+col])
@@ -1160,9 +1147,13 @@ ErrorStats compute_error_stats(const vector<double>& errors) {
     return s;
 }
 
-// (1) Reprojection error statistics per frame.
-void save_reproj_frame_errors(
+// (1) Reprojection error statistics, grouped by an arbitrary key.
+// group_mode: 0 = whole frame, 1 = per camera, 2 = per part.
+enum class ReprojGroup { Frame = 0, Cam = 1, Part = 2 };
+
+void save_reproj_errors(
     const string& path,
+    ReprojGroup group_mode,
     const map<long long, vector<Obs2>>& obs_by_frame,
     const vector<long long>& frame_numbers,
     const vector<array<double, 6>>& poses,
@@ -1176,7 +1167,15 @@ void save_reproj_frame_errors(
         return;
     }
 
-    ofs << "frame,t,num_obs,rmse_px,mean_abs_px,max_abs_px\n";
+    // Header depends on the grouping key.
+    switch (group_mode) {
+        case ReprojGroup::Frame:
+            ofs << "frame,t,num_obs,rmse_px,mean_abs_px,max_abs_px\n"; break;
+        case ReprojGroup::Cam:
+            ofs << "frame,t,cam,num_obs,rmse_px,mean_abs_px,max_abs_px\n"; break;
+        case ReprojGroup::Part:
+            ofs << "frame,t,part,num_obs,rmse_px,mean_abs_px,max_abs_px\n"; break;
+    }
 
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
@@ -1188,59 +1187,9 @@ void save_reproj_frame_errors(
         const auto& obs_frame = it->second;
         const auto& pose = poses[i];
 
-        vector<double> errors;
-
-        for (const auto& ob : obs_frame) {
-            // Skip observations for parts that are not in the template.
-            auto part_it = model_obj.find(ob.part);
-            if (part_it == model_obj.end()) continue;
-
-            ReprojError err = compute_reproj_error(
-                Ps[ob.cam], pose, part_it->second, ob.u, ob.v);
-
-            errors.push_back(err.error_px);
-        }
-
-        if (errors.empty()) continue;
-
-        auto stats = compute_error_stats(errors);
-        ofs << fr << "," << t << "," << errors.size() << ","
-            << stats.rmse << "," << stats.mean_abs << "," << stats.max_abs << "\n";
-    }
-
-    cout << "Saved reprojection errors (per frame) to " << path << endl;
-}
-
-// (2) Reprojection error statistics per frame and camera.
-void save_reproj_frame_cam_errors(
-    const string& path,
-    const map<long long, vector<Obs2>>& obs_by_frame,
-    const vector<long long>& frame_numbers,
-    const vector<array<double, 6>>& poses,
-    const unordered_map<string, array<double, 3>>& model_obj,
-    const vector<cv::Mat>& Ps,
-    double fps) {
-
-    ofstream ofs(path);
-    if (!ofs.is_open()) {
-        cerr << "ERROR: Cannot write " << path << endl;
-        return;
-    }
-
-    ofs << "frame,t,cam,num_obs,rmse_px,mean_abs_px,max_abs_px\n";
-
-    for (size_t i = 0; i < frame_numbers.size(); i++) {
-        long long fr = frame_numbers[i];
-        double t = fr / fps;
-
-        auto it = obs_by_frame.find(fr);
-        if (it == obs_by_frame.end()) continue;
-
-        const auto& obs_frame = it->second;
-        const auto& pose = poses[i];
-
-        // Group errors by camera.
-        map<int, vector<double>> cam_errors;
+        // Collect errors keyed by the chosen grouping dimension.
+        // Frame-level uses a single bucket under key "".
+        map<string, vector<double>> grouped;
 
         for (const auto& ob : obs_frame) {
             auto part_it = model_obj.find(ob.part);
@@ -1249,80 +1198,55 @@ void save_reproj_frame_cam_errors(
             ReprojError err = compute_reproj_error(
                 Ps[ob.cam], pose, part_it->second, ob.u, ob.v);
 
-            cam_errors[ob.cam].push_back(err.error_px);
+            string key;
+            switch (group_mode) {
+                case ReprojGroup::Frame: key = ""; break;
+                case ReprojGroup::Cam:   key = to_string(ob.cam); break;
+                case ReprojGroup::Part:  key = ob.part; break;
+            }
+            grouped[key].push_back(err.error_px);
         }
 
-        // Write one row per camera.
-        for (const auto& kv : cam_errors) {
-            int cam = kv.first;
+        for (const auto& kv : grouped) {
             const auto& errors = kv.second;
-
             if (errors.empty()) continue;
-
             auto stats = compute_error_stats(errors);
-            ofs << fr << "," << t << "," << cam << "," << errors.size() << ","
+
+            ofs << fr << "," << t << ",";
+            if (group_mode != ReprojGroup::Frame) ofs << kv.first << ",";
+            ofs << errors.size() << ","
                 << stats.rmse << "," << stats.mean_abs << "," << stats.max_abs << "\n";
         }
     }
 
-    cout << "Saved reprojection errors (per frame-cam) to " << path << endl;
+    cout << "Saved reprojection errors to " << path << endl;
 }
 
-// (3) Reprojection error statistics per frame and part.
-void save_reproj_frame_part_errors(
-    const string& path,
+// Write all three reproj diagnostics (frame / frame-cam / frame-part) for a prefix.
+// before/after comparison relies on identical column layout + frame set across calls.
+void save_all_reproj_diagnostics(
+    const string& dir,
+    const string& prefix,   // e.g. "pre_ba_reproj" or "reproj"
+    const string& suffix,   // e.g. "" or "_with_motion"
     const map<long long, vector<Obs2>>& obs_by_frame,
     const vector<long long>& frame_numbers,
     const vector<array<double, 6>>& poses,
     const unordered_map<string, array<double, 3>>& model_obj,
     const vector<cv::Mat>& Ps,
-    double fps) {
+    double fps,
+    vector<string>& generated_files) {
 
-    ofstream ofs(path);
-    if (!ofs.is_open()) {
-        cerr << "ERROR: Cannot write " << path << endl;
-        return;
-    }
+    const string p_frame = join_path(dir, prefix + "_frame"      + suffix + ".csv");
+    const string p_cam   = join_path(dir, prefix + "_frame_cam"  + suffix + ".csv");
+    const string p_part  = join_path(dir, prefix + "_frame_part" + suffix + ".csv");
 
-    ofs << "frame,t,part,num_obs,rmse_px,mean_abs_px,max_abs_px\n";
+    save_reproj_errors(p_frame, ReprojGroup::Frame, obs_by_frame, frame_numbers, poses, model_obj, Ps, fps);
+    save_reproj_errors(p_cam,   ReprojGroup::Cam,   obs_by_frame, frame_numbers, poses, model_obj, Ps, fps);
+    save_reproj_errors(p_part,  ReprojGroup::Part,  obs_by_frame, frame_numbers, poses, model_obj, Ps, fps);
 
-    for (size_t i = 0; i < frame_numbers.size(); i++) {
-        long long fr = frame_numbers[i];
-        double t = fr / fps;
-
-        auto it = obs_by_frame.find(fr);
-        if (it == obs_by_frame.end()) continue;
-
-        const auto& obs_frame = it->second;
-        const auto& pose = poses[i];
-
-        // Group errors by body part.
-        map<string, vector<double>> part_errors;
-
-        for (const auto& ob : obs_frame) {
-            auto part_it = model_obj.find(ob.part);
-            if (part_it == model_obj.end()) continue;
-
-            ReprojError err = compute_reproj_error(
-                Ps[ob.cam], pose, part_it->second, ob.u, ob.v);
-
-            part_errors[ob.part].push_back(err.error_px);
-        }
-
-        // Write one row per body part.
-        for (const auto& kv : part_errors) {
-            const string& part = kv.first;
-            const auto& errors = kv.second;
-
-            if (errors.empty()) continue;
-
-            auto stats = compute_error_stats(errors);
-            ofs << fr << "," << t << "," << part << "," << errors.size() << ","
-                << stats.rmse << "," << stats.mean_abs << "," << stats.max_abs << "\n";
-        }
-    }
-
-    cout << "Saved reprojection errors (per frame-part) to " << path << endl;
+    generated_files.push_back(p_frame);
+    generated_files.push_back(p_cam);
+    generated_files.push_back(p_part);
 }
 
 // (4) Motion-track error statistics per frame.
@@ -1741,7 +1665,7 @@ int main(int argc, char** argv) {
             cout << "  --motion-track      Enable motion-track constraint\n";
             cout << "  --no-motion-track   Disable motion-track constraint\n";
             cout << "  --lambda <value>    Motion-track weight (default: 1.0)\n";
-            cout << "  --grid-step <value> Grid step in mm (default: 10.0)\n";
+            cout << "  --grid-step <value> Grid step in mm (default: 25.0)\n";
             cout << "  --grid_step <value> Alias for --grid-step\n";
             cout << "  --mt-center <part>  Use a template body part as the motion-track grid center\n";
             cout << "  --stride <value>    Frame stride, use every Nth frame (default: 1)\n";
@@ -1978,10 +1902,12 @@ int main(int argc, char** argv) {
         cout << "Completed warm start for all frames" << endl;
 
         {
-            const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
-            const string warm_start_pose_path = join_path(diag_dir, "warm_start_pose" + suffix + ".csv");
-            save_poses(warm_start_pose_path, frame_numbers, poses, fps, use_motion_track, gap_frame_set);
-            generated_files.push_back(warm_start_pose_path);
+            // warm start runs before BA and is independent of motion-track; single file.
+            const string warm_start_pose_path = join_path(diag_dir, "warm_start_pose.csv");
+            if (!file_exists(warm_start_pose_path)) {
+                save_poses(warm_start_pose_path, frame_numbers, poses, fps, false, gap_frame_set);
+                generated_files.push_back(warm_start_pose_path);
+            }
         }
     } else {
         cout << "Warm start disabled; global BA will start from the direct pose seed" << endl;
@@ -2022,20 +1948,11 @@ int main(int argc, char** argv) {
 
     // Output pre-BA reprojection diagnostics for before/after comparison.
     {
-        const string pre_reproj_frame_path      = join_path(diag_dir, "pre_ba_reproj_frame.csv");
-        const string pre_reproj_frame_cam_path  = join_path(diag_dir, "pre_ba_reproj_frame_cam.csv");
-        const string pre_reproj_frame_part_path = join_path(diag_dir, "pre_ba_reproj_frame_part.csv");
-
+        const string pre_reproj_frame_path = join_path(diag_dir, "pre_ba_reproj_frame.csv");
         if (!file_exists(pre_reproj_frame_path)) {
-            save_reproj_frame_errors(pre_reproj_frame_path, obs_by_frame, frame_numbers,
-                                     poses, model_obj, Ps, fps);
-            save_reproj_frame_cam_errors(pre_reproj_frame_cam_path, obs_by_frame, frame_numbers,
-                                         poses, model_obj, Ps, fps);
-            save_reproj_frame_part_errors(pre_reproj_frame_part_path, obs_by_frame, frame_numbers,
-                                          poses, model_obj, Ps, fps);
-            generated_files.push_back(pre_reproj_frame_path);
-            generated_files.push_back(pre_reproj_frame_cam_path);
-            generated_files.push_back(pre_reproj_frame_part_path);
+            save_all_reproj_diagnostics(diag_dir, "pre_ba_reproj", "",
+                                        obs_by_frame, frame_numbers, poses,
+                                        model_obj, Ps, fps, generated_files);
         }
     }
 
@@ -2103,20 +2020,9 @@ int main(int argc, char** argv) {
         cout << "\nStep 6: Saving diagnostics..." << endl;
         const string suffix = use_motion_track ? "_with_motion" : "_no_motion";
 
-        const string reproj_frame_path      = join_path(diag_dir, "reproj_frame"      + suffix + ".csv");
-        const string reproj_frame_cam_path  = join_path(diag_dir, "reproj_frame_cam"  + suffix + ".csv");
-        const string reproj_frame_part_path = join_path(diag_dir, "reproj_frame_part" + suffix + ".csv");
-
-        save_reproj_frame_errors(reproj_frame_path, obs_by_frame, frame_numbers,
-                                 poses, model_obj, Ps, fps);
-        save_reproj_frame_cam_errors(reproj_frame_cam_path, obs_by_frame, frame_numbers,
-                                     poses, model_obj, Ps, fps);
-        save_reproj_frame_part_errors(reproj_frame_part_path, obs_by_frame, frame_numbers,
-                                      poses, model_obj, Ps, fps);
-
-        generated_files.push_back(reproj_frame_path);
-        generated_files.push_back(reproj_frame_cam_path);
-        generated_files.push_back(reproj_frame_part_path);
+        save_all_reproj_diagnostics(diag_dir, "reproj", suffix,
+                                    obs_by_frame, frame_numbers, poses,
+                                    model_obj, Ps, fps, generated_files);
 
         if (use_motion_track) {
             const string track_frame_path = join_path(diag_dir, "track_frame" + suffix + ".csv");
