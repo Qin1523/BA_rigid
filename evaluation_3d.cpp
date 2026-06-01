@@ -37,8 +37,8 @@ struct Point3Row {
 
 struct AggregateAccumulator {
     size_t gt_points = 0;
-    size_t matched_points = 0;
-    double matched_sum_sq = 0.0;
+    size_t pred_points = 0;
+    double sum_sq = 0.0;
     array<size_t, 3> restored_counts = {0, 0, 0};
     array<double, 3> restored_sum_sq = {0.0, 0.0, 0.0};
 };
@@ -48,7 +48,6 @@ struct PointAuditRow {
     long long frame = 0;
     double t = numeric_limits<double>::quiet_NaN();
     string part;
-    string status;
     double gt_x = numeric_limits<double>::quiet_NaN();
     double gt_y = numeric_limits<double>::quiet_NaN();
     double gt_z = numeric_limits<double>::quiet_NaN();
@@ -57,7 +56,6 @@ struct PointAuditRow {
     double pred_z = numeric_limits<double>::quiet_NaN();
     double error_3d = numeric_limits<double>::quiet_NaN();
     int restored = 0;
-    bool is_large_error = false;
 };
 
 struct FrameSummaryRow {
@@ -65,23 +63,20 @@ struct FrameSummaryRow {
     long long frame = 0;
     double t = numeric_limits<double>::quiet_NaN();
     size_t gt_num_parts = 0;
-    size_t matched_num_parts = 0;
-    double coverage = numeric_limits<double>::quiet_NaN();
-    double matched_rmse_3d = numeric_limits<double>::quiet_NaN();
+    double rmse_3d = numeric_limits<double>::quiet_NaN();
     int restored = 0;
     int has_missing_camera = 0;
+    bool is_high_error = false;
 };
 
 struct PartSummaryRow {
     string method;
     string part;
     size_t gt_points = 0;
-    size_t matched_points = 0;
-    double coverage = numeric_limits<double>::quiet_NaN();
-    double matched_rmse_3d = numeric_limits<double>::quiet_NaN();
-    double matched_rmse_restored0 = numeric_limits<double>::quiet_NaN();
-    double matched_rmse_restored1 = numeric_limits<double>::quiet_NaN();
-    double matched_rmse_restored2 = numeric_limits<double>::quiet_NaN();
+    double rmse_3d = numeric_limits<double>::quiet_NaN();
+    double rmse_restored0 = numeric_limits<double>::quiet_NaN();
+    double rmse_restored1 = numeric_limits<double>::quiet_NaN();
+    double rmse_restored2 = numeric_limits<double>::quiet_NaN();
     size_t count_restored0 = 0;
     size_t count_restored1 = 0;
     size_t count_restored2 = 0;
@@ -91,8 +86,7 @@ struct OverallSummaryRow {
     string method;
     size_t gt_total_points = 0;
     size_t matched_points = 0;
-    double coverage = numeric_limits<double>::quiet_NaN();
-    double matched_rmse_3d = numeric_limits<double>::quiet_NaN();
+    double rmse_3d = numeric_limits<double>::quiet_NaN();
 };
 
 struct MissingObs {
@@ -447,13 +441,6 @@ double safe_rmse(double sum_sq, size_t count) {
     return sqrt(sum_sq / static_cast<double>(count));
 }
 
-double safe_ratio(size_t numerator, size_t denominator) {
-    if (denominator == 0) {
-        return numeric_limits<double>::quiet_NaN();
-    }
-    return static_cast<double>(numerator) / static_cast<double>(denominator);
-}
-
 string format_double_or_empty(double value) {
     if (std::isnan(value)) {
         return "";
@@ -480,12 +467,6 @@ int method_sort_rank(const string& method) {
     return static_cast<int>(kMethodOrder.size());
 }
 
-int status_sort_rank(const string& status) {
-    if (status == "matched") return 0;
-    if (status == "extra_prediction") return 1;
-    return 2;
-}
-
 double compute_median(vector<double> values) {
     if (values.empty()) {
         return numeric_limits<double>::quiet_NaN();
@@ -502,8 +483,8 @@ double compute_median(vector<double> values) {
 double compute_frame_high_error_threshold(const vector<FrameSummaryRow>& frame_rows) {
     vector<double> finite_values;
     for (const auto& row : frame_rows) {
-        if (!std::isnan(row.matched_rmse_3d)) {
-            finite_values.push_back(row.matched_rmse_3d);
+        if (!std::isnan(row.rmse_3d)) {
+            finite_values.push_back(row.rmse_3d);
         }
     }
 
@@ -600,7 +581,6 @@ MethodEvaluation evaluate_method(const string& method,
         const double error_3d = compute_distance_3d(gt_row, pred_row);
         const double error_sq = error_3d * error_3d;
 
-        row.status = "matched";
         row.t = choose_time_value(gt_row.t, pred_row.t);
         row.pred_x = pred_row.x;
         row.pred_y = pred_row.y;
@@ -608,47 +588,26 @@ MethodEvaluation evaluate_method(const string& method,
         row.error_3d = error_3d;
         row.restored = normalize_restored_value(pred_row.restored);
 
-        frame_acc.matched_points++;
-        frame_acc.matched_sum_sq += error_sq;
+        frame_acc.pred_points++;
+        frame_acc.sum_sq += error_sq;
         frame_restored[gt_row.frame] = max(frame_restored[gt_row.frame], row.restored);
 
-        part_acc.matched_points++;
-        part_acc.matched_sum_sq += error_sq;
+        part_acc.pred_points++;
+        part_acc.sum_sq += error_sq;
         part_acc.restored_counts[row.restored]++;
         part_acc.restored_sum_sq[row.restored] += error_sq;
 
-        overall_accumulator.matched_points++;
-        overall_accumulator.matched_sum_sq += error_sq;
+        overall_accumulator.pred_points++;
+        overall_accumulator.sum_sq += error_sq;
 
-        evaluation.point_rows.push_back(row);
-    }
-
-    for (const auto& kv : pred) {
-        if (gt.count(kv.first)) {
-            continue;
-        }
-
-        const Point3Row& pred_row = kv.second;
-        PointAuditRow row;
-        row.method = method;
-        row.frame = pred_row.frame;
-        row.t = pred_row.t;
-        row.part = pred_row.part;
-        row.status = "extra_prediction";
-        row.pred_x = pred_row.x;
-        row.pred_y = pred_row.y;
-        row.pred_z = pred_row.z;
-        row.restored = normalize_restored_value(pred_row.restored);
         evaluation.point_rows.push_back(row);
     }
 
     evaluation.overall_row.method = method;
     evaluation.overall_row.gt_total_points = overall_accumulator.gt_points;
-    evaluation.overall_row.matched_points = overall_accumulator.matched_points;
-    evaluation.overall_row.coverage = safe_ratio(
-        overall_accumulator.matched_points, overall_accumulator.gt_points);
-    evaluation.overall_row.matched_rmse_3d = safe_rmse(
-        overall_accumulator.matched_sum_sq, overall_accumulator.matched_points);
+    evaluation.overall_row.matched_points = overall_accumulator.pred_points;
+    evaluation.overall_row.rmse_3d = safe_rmse(
+        overall_accumulator.sum_sq, overall_accumulator.pred_points);
 
     for (const auto& kv : frame_accumulators) {
         FrameSummaryRow row;
@@ -659,9 +618,7 @@ MethodEvaluation evaluate_method(const string& method,
             row.t = time_it->second;
         }
         row.gt_num_parts = kv.second.gt_points;
-        row.matched_num_parts = kv.second.matched_points;
-        row.coverage = safe_ratio(kv.second.matched_points, kv.second.gt_points);
-        row.matched_rmse_3d = safe_rmse(kv.second.matched_sum_sq, kv.second.matched_points);
+        row.rmse_3d = safe_rmse(kv.second.sum_sq, kv.second.pred_points);
         auto restored_it = frame_restored.find(kv.first);
         if (restored_it != frame_restored.end()) {
             row.restored = restored_it->second;
@@ -675,17 +632,15 @@ MethodEvaluation evaluate_method(const string& method,
         row.method = method;
         row.part = kv.first;
         row.gt_points = kv.second.gt_points;
-        row.matched_points = kv.second.matched_points;
-        row.coverage = safe_ratio(kv.second.matched_points, kv.second.gt_points);
-        row.matched_rmse_3d = safe_rmse(kv.second.matched_sum_sq, kv.second.matched_points);
+        row.rmse_3d = safe_rmse(kv.second.sum_sq, kv.second.pred_points);
         row.count_restored0 = kv.second.restored_counts[0];
         row.count_restored1 = kv.second.restored_counts[1];
         row.count_restored2 = kv.second.restored_counts[2];
-        row.matched_rmse_restored0 = safe_rmse(
+        row.rmse_restored0 = safe_rmse(
             kv.second.restored_sum_sq[0], kv.second.restored_counts[0]);
-        row.matched_rmse_restored1 = safe_rmse(
+        row.rmse_restored1 = safe_rmse(
             kv.second.restored_sum_sq[1], kv.second.restored_counts[1]);
-        row.matched_rmse_restored2 = safe_rmse(
+        row.rmse_restored2 = safe_rmse(
             kv.second.restored_sum_sq[2], kv.second.restored_counts[2]);
         evaluation.part_rows.push_back(row);
     }
@@ -701,19 +656,17 @@ MethodEvaluation evaluate_method(const string& method,
              << high_error_threshold << endl;
     }
 
-    for (auto& row : evaluation.point_rows) {
-        row.is_large_error =
-            row.status == "matched" &&
-            !std::isnan(row.error_3d) &&
+    for (auto& row : evaluation.frame_rows) {
+        row.is_high_error =
+            !std::isnan(row.rmse_3d) &&
             std::isfinite(high_error_threshold) &&
-            row.error_3d > high_error_threshold;
+            row.rmse_3d > high_error_threshold;
     }
 
     sort(evaluation.point_rows.begin(), evaluation.point_rows.end(),
          [](const PointAuditRow& a, const PointAuditRow& b) {
              if (a.frame != b.frame) return a.frame < b.frame;
-             if (a.part != b.part) return a.part < b.part;
-             return status_sort_rank(a.status) < status_sort_rank(b.status);
+             return a.part < b.part;
          });
 
     return evaluation;
@@ -727,13 +680,12 @@ void save_overall_csv(const string& path,
         return;
     }
 
-    ofs << "method,gt_total_points,matched_points,coverage,matched_rmse_3d\n";
+    ofs << "method,gt_total_points,matched_points,rmse_3d\n";
     for (const auto& row : overall_rows) {
         ofs << row.method << ","
             << row.gt_total_points << ","
             << row.matched_points << ","
-            << format_double_or_empty(row.coverage) << ","
-            << format_double_or_empty(row.matched_rmse_3d) << "\n";
+            << format_double_or_empty(row.rmse_3d) << "\n";
     }
 
     cout << "Saved overall 3D evaluation to " << path << endl;
@@ -747,17 +699,16 @@ void save_frame_audit_csv(const string& path,
         return;
     }
 
-    ofs << "method,frame,t,gt_num_parts,matched_num_parts,coverage,matched_rmse_3d,restored,has_missing_camera\n";
+    ofs << "method,frame,t,gt_num_parts,rmse_3d,restored,has_missing_camera,is_high_error\n";
     for (const auto& row : frame_rows) {
         ofs << row.method << ","
             << row.frame << ","
             << format_double_or_empty(row.t) << ","
             << row.gt_num_parts << ","
-            << row.matched_num_parts << ","
-            << format_double_or_empty(row.coverage) << ","
-            << format_double_or_empty(row.matched_rmse_3d) << ","
+            << format_double_or_empty(row.rmse_3d) << ","
             << row.restored << ","
-            << row.has_missing_camera << "\n";
+            << row.has_missing_camera << ","
+            << (row.is_high_error ? 1 : 0) << "\n";
     }
 
     cout << "Saved per-frame audit to " << path << endl;
@@ -771,19 +722,17 @@ void save_part_csv(const string& path,
         return;
     }
 
-    ofs << "method,part,gt_points,matched_points,coverage,matched_rmse_3d,"
-           "matched_rmse_restored0,matched_rmse_restored1,matched_rmse_restored2,"
+    ofs << "method,part,gt_points,rmse_3d,"
+           "rmse_restored0,rmse_restored1,rmse_restored2,"
            "count_restored0,count_restored1,count_restored2\n";
     for (const auto& row : part_rows) {
         ofs << row.method << ","
             << row.part << ","
             << row.gt_points << ","
-            << row.matched_points << ","
-            << format_double_or_empty(row.coverage) << ","
-            << format_double_or_empty(row.matched_rmse_3d) << ","
-            << format_double_or_empty(row.matched_rmse_restored0) << ","
-            << format_double_or_empty(row.matched_rmse_restored1) << ","
-            << format_double_or_empty(row.matched_rmse_restored2) << ","
+            << format_double_or_empty(row.rmse_3d) << ","
+            << format_double_or_empty(row.rmse_restored0) << ","
+            << format_double_or_empty(row.rmse_restored1) << ","
+            << format_double_or_empty(row.rmse_restored2) << ","
             << row.count_restored0 << ","
             << row.count_restored1 << ","
             << row.count_restored2 << "\n";
@@ -800,13 +749,12 @@ void save_point_audit_csv(const string& path,
         return;
     }
 
-    ofs << "method,frame,t,part,status,gt_x,gt_y,gt_z,pred_x,pred_y,pred_z,error_3d,restored,is_large_error\n";
+    ofs << "method,frame,t,part,gt_x,gt_y,gt_z,pred_x,pred_y,pred_z,error_3d,restored\n";
     for (const auto& row : point_rows) {
         ofs << row.method << ","
             << row.frame << ","
             << format_double_or_empty(row.t) << ","
             << row.part << ","
-            << row.status << ","
             << format_double_or_empty(row.gt_x) << ","
             << format_double_or_empty(row.gt_y) << ","
             << format_double_or_empty(row.gt_z) << ","
@@ -814,8 +762,7 @@ void save_point_audit_csv(const string& path,
             << format_double_or_empty(row.pred_y) << ","
             << format_double_or_empty(row.pred_z) << ","
             << format_double_or_empty(row.error_3d) << ","
-            << row.restored << ","
-            << (row.is_large_error ? 1 : 0) << "\n";
+            << row.restored << "\n";
     }
 
     cout << "Saved point-level audit to " << path << endl;
@@ -891,8 +838,13 @@ int main(int argc, char** argv) {
 
     unordered_set<long long> missing_cam_frames;
     {
-        const string audit_path = resolve_input_path(
+        const string audit_path_primary = resolve_input_path(
+            "results/diagnostics/anomaly_missing_obs.csv", executable_dir);
+        const string audit_path_fallback = resolve_input_path(
             "results/anomaly_missing_obs.csv", executable_dir);
+        const string audit_path = file_exists(audit_path_primary)
+            ? audit_path_primary
+            : audit_path_fallback;
         if (file_exists(audit_path)) {
             vector<MissingObs> audit = load_observation_audit(audit_path);
             for (const auto& m : audit) {
@@ -963,9 +915,7 @@ int main(int argc, char** argv) {
     for (const auto& evaluation : evaluations) {
         cout << evaluation.method
              << ": gt_points=" << evaluation.overall_row.gt_total_points
-             << ", matched=" << evaluation.overall_row.matched_points
-             << ", coverage=" << format_double_or_empty(evaluation.overall_row.coverage)
-             << ", matched_rmse_3d=" << format_double_or_empty(evaluation.overall_row.matched_rmse_3d)
+             << ", rmse_3d=" << format_double_or_empty(evaluation.overall_row.rmse_3d)
              << endl;
 
         all_point_rows.insert(all_point_rows.end(),

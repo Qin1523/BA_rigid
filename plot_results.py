@@ -272,19 +272,19 @@ def plot_evaluation(results_dir, out_dir):
     if not methods:
         methods = method_order
 
-    matched_rmse_data = {method: [] for method in methods}
-    coverage_data = {method: [] for method in methods}
+    rmse_data = {method: [] for method in methods}
+    high_error_data = {method: [] for method in methods}
     for row in frame_rows:
         method = row.get("method")
-        if method not in matched_rmse_data:
+        if method not in rmse_data:
             continue
         t = parse_float(row.get("t"))
-        matched_rmse = parse_float(row.get("matched_rmse_3d"))
-        coverage = parse_float(row.get("coverage"))
-        if t is not None and matched_rmse is not None:
-            matched_rmse_data[method].append((t, matched_rmse))
-        if t is not None and coverage is not None:
-            coverage_data[method].append((t, coverage))
+        rmse = parse_float(row.get("rmse_3d"))
+        is_high_error = parse_int(row.get("is_high_error"))
+        if t is not None and rmse is not None:
+            rmse_data[method].append((t, rmse))
+            if is_high_error == 1:
+                high_error_data[method].append((t, rmse))
 
     def plot_time_series_overlay(data_map, ylabel, title, output_name):
         method_draw_order = [
@@ -324,6 +324,20 @@ def plot_evaluation(results_dir, out_dir):
                 zorder=zorder,
                 **style_map.get(method, {}),
             )
+            flagged = high_error_data.get(method, [])
+            if flagged:
+                flagged = sorted(flagged)
+                ax.scatter(
+                    [item[0] for item in flagged],
+                    [item[1] for item in flagged],
+                    s=20,
+                    marker="o",
+                    facecolors=colors.get(method, "#888888"),
+                    edgecolors="#111111",
+                    linewidths=0.5,
+                    alpha=0.95,
+                    zorder=zorder + 0.5,
+                )
 
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(ylabel)
@@ -335,60 +349,12 @@ def plot_evaluation(results_dir, out_dir):
         plt.savefig(os.path.join(out_dir, output_name), dpi=200)
         plt.close()
 
-    def plot_time_series_split(data_map, ylabel, title_prefix, output_prefix):
-        groups = {
-            "no_motion": ["rigid_no_motion", "restored_no_motion"],
-            "with_motion": ["rigid_with_motion", "restored_with_motion"],
-        }
-
-        for group_name, group_methods in groups.items():
-            has_data = any(data_map.get(m) for m in group_methods)
-            output_name = f"{output_prefix}_{group_name}.png"
-            title = f"{title_prefix} ({group_name.replace('_', ' ').title()})"
-
-            if not has_data:
-                save_empty_plot(os.path.join(out_dir, output_name), title, "No data available")
-                continue
-
-            plt.figure(figsize=(10, 4.5))
-            ax = plt.gca()
-            add_restored_overlays(ax, group_methods, restored_spans)
-            for method in group_methods:
-                if method not in data_map:
-                    continue
-                series = sorted(data_map[method])
-                if not series:
-                    continue
-                times = [item[0] for item in series]
-                values = [item[1] for item in series]
-                ax.plot(
-                    times,
-                    values,
-                    marker="o",
-                    linewidth=1.7,
-                    markersize=3.0,
-                    label=labels[method],
-                    color=colors[method],
-                    alpha=0.85,
-                )
-
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-            add_frame_axis(ax, frame_time_map)
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, output_name), dpi=200)
-            plt.close()
-
     plot_time_series_overlay(
-        matched_rmse_data,
-        "Matched 3D RMSE",
-        "Matched 3D RMSE vs Time",
+        rmse_data,
+        "3D RMSE",
+        "3D RMSE vs Time",
         "rmse_3d_vs_time.png",
     )
-    plot_time_series_split(coverage_data, "Coverage", "Coverage vs Time", "coverage_vs_time")
 
     part_rows = read_csv(os.path.join(results_dir, "eval_3d_part.csv"))
     part_methods = active_methods(part_rows)
@@ -410,7 +376,7 @@ def plot_evaluation(results_dir, out_dir):
     for row in part_rows:
         method = row.get("method")
         part = row.get("part")
-        rmse = parse_float(row.get("matched_rmse_3d"))
+        rmse = parse_float(row.get("rmse_3d"))
         if not part:
             continue
         if part not in seen_parts:
@@ -420,19 +386,19 @@ def plot_evaluation(results_dir, out_dir):
             part_values[method][part] = rmse
         if method in layer_values:
             for restored in (0, 1, 2):
-                layer_rmse = parse_float(row.get(f"matched_rmse_restored{restored}"))
+                layer_rmse = parse_float(row.get(f"rmse_restored{restored}"))
                 if layer_rmse is not None:
                     layer_values[method][restored][part] = layer_rmse
 
     if not part_order:
         save_empty_plot(
             os.path.join(out_dir, "rmse_3d_per_part.png"),
-            "Matched 3D RMSE per Part",
+            "3D RMSE per Part",
             "No part data available",
         )
         save_empty_plot(
             os.path.join(out_dir, "rmse_3d_per_part_restored_category.png"),
-            "Matched 3D RMSE per Part(restored category)",
+            "3D RMSE per Part(restored category)",
             "No part data available",
         )
     else:
@@ -454,8 +420,8 @@ def plot_evaluation(results_dir, out_dir):
             )
         ax.set_xticks(x)
         ax.set_xticklabels(part_order, rotation=35, ha="right")
-        ax.set_ylabel("Matched 3D RMSE")
-        ax.set_title("Matched 3D RMSE per Part")
+        ax.set_ylabel("3D RMSE")
+        ax.set_title("3D RMSE per Part")
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend()
         plt.tight_layout()
@@ -486,8 +452,8 @@ def plot_evaluation(results_dir, out_dir):
                 )
         ax.set_xticks(x)
         ax.set_xticklabels(part_order, rotation=35, ha="right")
-        ax.set_ylabel("Matched 3D RMSE")
-        ax.set_title("Matched 3D RMSE per Part(restored category)")
+        ax.set_ylabel("3D RMSE")
+        ax.set_title("3D RMSE per Part(restored category)")
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend(ncol=2, fontsize=8)
         plt.tight_layout()
@@ -511,7 +477,10 @@ _OBS_RESULTS_DIR = "./results"
 
 
 def plot_observation(out_dir):
-    anomaly_rows = read_csv(os.path.join(_OBS_RESULTS_DIR, "anomaly_missing_obs.csv"))
+    anomaly_path = os.path.join(_OBS_RESULTS_DIR, "diagnostics", "anomaly_missing_obs.csv")
+    if not os.path.exists(anomaly_path):
+        anomaly_path = os.path.join(_OBS_RESULTS_DIR, "anomaly_missing_obs.csv")
+    anomaly_rows = read_csv(anomaly_path)
     frame_rows = read_csv(os.path.join(_OBS_RESULTS_DIR, "eval_3d_frame_audit.csv"))
 
     base_frame_time_map = build_frame_time_map(frame_rows)
