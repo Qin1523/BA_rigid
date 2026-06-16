@@ -500,7 +500,7 @@ bool estimate_initial_translation_from_sequence(
     const unordered_map<string, array<double, 3>>& model_obj,
     const vector<cv::Mat>& Ps,
     map<long long, array<double, 3>>& seed_map,
-    int segment_length = 150) {
+    int segment_length = 50) {
 
     seed_map.clear();
 
@@ -554,6 +554,139 @@ bool estimate_initial_translation_from_sequence(
     return true;
 }
 
+// Estimate a per-frame rotation seed by aligning the observed tail_base->
+// head_center body axis with the template's default body axis. Computed
+// independently for every frame (no segmentation) since orientation can
+// flip ~180 degrees within a single frame during sharp turns.
+//
+// model_obj must contain "head center" and "tail base".
+// Returns true if the template axis itself is valid; per-frame failures
+// (insufficient views, degenerate triangulation) are recorded by omission
+// from rotation_seed_map, not by returning false.
+bool estimate_initial_rotation_seeds(
+    const map<long long, vector<Obs2>>& obs_by_frame,
+    const unordered_map<string, array<double, 3>>& model_obj,
+    const vector<cv::Mat>& Ps,
+    map<long long, array<double, 3>>& rotation_seed_map) {
+
+    rotation_seed_map.clear();
+
+    auto hc_it = model_obj.find("head center");
+    auto tb_it = model_obj.find("tail base");
+    if (hc_it == model_obj.end() || tb_it == model_obj.end()) {
+        cerr << "ERROR: Template must contain 'head center' and 'tail base' "
+             << "for rotation seed estimation" << endl;
+        return false;
+    }
+
+    // Template body axis: tail_base -> head_center (object frame), normalized.
+    double tax = hc_it->second[0] - tb_it->second[0];
+    double tay = hc_it->second[1] - tb_it->second[1];
+    double taz = hc_it->second[2] - tb_it->second[2];
+    double tlen = sqrt(tax*tax + tay*tay + taz*taz);
+    if (tlen < 1e-6) {
+        cerr << "ERROR: Template head_center and tail_base coincide" << endl;
+        return false;
+    }
+    array<double, 3> tmpl_axis = {tax/tlen, tay/tlen, taz/tlen};
+
+    int success_count = 0;
+    for (const auto& kv : obs_by_frame) {
+        long long fr = kv.first;
+
+        vector<pair<int, cv::Point2d>> hc_views, tb_views;
+        for (const auto& ob : kv.second) {
+            if (ob.part == "head center")
+                hc_views.push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
+            else if (ob.part == "tail base")
+                tb_views.push_back({ob.cam, cv::Point2d(ob.u, ob.v)});
+        }
+        if (hc_views.size() < 2 || tb_views.size() < 2) continue;  // missing -> skip
+
+        cv::Point3d X_hc = triangulate_DLT(hc_views, Ps);
+        cv::Point3d X_tb = triangulate_DLT(tb_views, Ps);
+        if (!std::isfinite(X_hc.x) || !std::isfinite(X_hc.y) || !std::isfinite(X_hc.z) ||
+            !std::isfinite(X_tb.x) || !std::isfinite(X_tb.y) || !std::isfinite(X_tb.z))
+            continue;  // degenerate triangulation -> skip
+
+        // Observed body axis: tail_base -> head_center (world frame), normalized.
+        double dx = X_hc.x - X_tb.x;
+        double dy = X_hc.y - X_tb.y;
+        double dz = X_hc.z - X_tb.z;
+        double dlen = sqrt(dx*dx + dy*dy + dz*dz);
+        if (dlen < 1e-6) continue;
+        double obs_axis[3] = {dx/dlen, dy/dlen, dz/dlen};
+
+        // Rotation aligning tmpl_axis -> obs_axis via cross/dot.
+        double cross[3] = {
+            tmpl_axis[1]*obs_axis[2] - tmpl_axis[2]*obs_axis[1],
+            tmpl_axis[2]*obs_axis[0] - tmpl_axis[0]*obs_axis[2],
+            tmpl_axis[0]*obs_axis[1] - tmpl_axis[1]*obs_axis[0]
+        };
+        double sin_theta = sqrt(cross[0]*cross[0] + cross[1]*cross[1] + cross[2]*cross[2]);
+        double cos_theta = tmpl_axis[0]*obs_axis[0] + tmpl_axis[1]*obs_axis[1] + tmpl_axis[2]*obs_axis[2];
+        double theta = atan2(sin_theta, cos_theta);
+
+        array<double, 3> rot_seed;
+        if (sin_theta < 1e-6) {
+            if (cos_theta > 0) {
+                rot_seed = {0.0, 0.0, 0.0};  // already aligned
+            } else {
+                // 180 deg: pick any axis perpendicular to tmpl_axis.
+                double px = 1.0, py = 0.0, pz = 0.0;
+                if (fabs(tmpl_axis[0]) > 0.9) { px = 0.0; py = 1.0; }
+                rot_seed = {M_PI*px, M_PI*py, M_PI*pz};
+            }
+        } else {
+            double scale = theta / sin_theta;
+            rot_seed = {scale*cross[0], scale*cross[1], scale*cross[2]};
+        }
+
+        rotation_seed_map[fr] = rot_seed;
+        success_count++;
+    }
+
+    cout << "Rotation seeds estimated for " << success_count
+         << " / " << obs_by_frame.size() << " frames (per-frame, no segmentation)" << endl;
+    return true;
+}
+
+// Look up a rotation seed for a given frame.
+//   allow_nearest_neighbor = false (default): missing -> zero rotation.
+//   allow_nearest_neighbor = true: missing -> borrow nearest available seed
+//     within max_distance frames; beyond that -> zero rotation.
+// Default is false because orientation can flip ~180 deg between adjacent
+// frames during sharp turns (verified: most turning events span only ~5
+// frames), so borrowing a neighbor's rotation risks injecting a confidently
+// wrong direction rather than a neutral unknown.
+array<double, 3> lookup_rotation_seed(
+    long long frame,
+    const map<long long, array<double, 3>>& rotation_seed_map,
+    bool allow_nearest_neighbor = false,
+    long long max_distance = 5) {
+
+    auto exact = rotation_seed_map.find(frame);
+    if (exact != rotation_seed_map.end()) return exact->second;
+
+    if (!allow_nearest_neighbor || rotation_seed_map.empty())
+        return {0.0, 0.0, 0.0};
+
+    auto it = rotation_seed_map.lower_bound(frame);
+    long long best_dist = max_distance + 1;
+    array<double, 3> best = {0.0, 0.0, 0.0};
+
+    if (it != rotation_seed_map.end()) {
+        long long d = it->first - frame;
+        if (d <= max_distance) { best_dist = d; best = it->second; }
+    }
+    if (it != rotation_seed_map.begin()) {
+        auto prev_it = prev(it);
+        long long d = frame - prev_it->first;
+        if (d < best_dist) { best = prev_it->second; }
+    }
+    return best;
+}
+
 // Look up the nearest translation seed for a given frame number.
 array<double, 3> lookup_translation_seed(
     long long frame,
@@ -570,6 +703,22 @@ array<double, 3> lookup_translation_seed(
     long long dist_prev = frame - prev_it->first;
     long long dist_next = it->first - frame;
     return (dist_prev <= dist_next) ? prev_it->second : it->second;
+}
+
+// Look up the translation seed of the segment that strictly contains this
+// frame (i.e. the segment whose seg_start <= frame), instead of picking
+// whichever seed boundary is numerically closest. Used as a controlled
+// alternative to lookup_translation_seed() for comparison experiments.
+array<double, 3> lookup_translation_seed_strict(
+    long long frame,
+    const map<long long, array<double, 3>>& seed_map) {
+
+    if (seed_map.empty()) return {0.0, 0.0, 0.0};
+
+    auto it = seed_map.upper_bound(frame);
+
+    if (it == seed_map.begin()) return it->second;
+    return prev(it)->second;
 }
 
 array<double, 3> compute_template_centroid_obj(
@@ -868,7 +1017,7 @@ ceres::Solver::Summary global_bundle_adjustment(
     double lambda,
     double grid_step,
     const array<double, 3>& motion_track_center_obj,
-    double body_scale) {
+    double body_scale){
 
     ceres::Problem prob;
     ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
@@ -897,6 +1046,7 @@ ceres::Solver::Summary global_bundle_adjustment(
         double weight = sqrt(lambda);
 
         for (size_t i = 2; i < frame_numbers.size() - 2; i++) {
+
             ceres::CostFunction* cost =
                 MotionTrackGridCost::Create(weight, grid_step, motion_track_center_obj, body_scale);
 
@@ -1776,6 +1926,11 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    map<long long, array<double, 3>> rotation_seed_map;
+    if (!estimate_initial_rotation_seeds(obs_by_frame, model_obj, Ps, rotation_seed_map)) {
+        return -1;
+    }
+
     array<double, 3> motion_track_center_obj = template_centroid_obj;
     if (mt_center_part_specified) {
         auto mt_center_it = model_obj.find(mt_center_part);
@@ -1859,8 +2014,12 @@ int main(int argc, char** argv) {
         if (frame_idx % frame_stride == 0) {
             frame_numbers.push_back(kv.first);
             auto t_seed = lookup_translation_seed(kv.first, seed_map);
-            poses.push_back({0.0, 0.0, 0.0,
+            // auto t_seed = lookup_translation_seed_strict(kv.first, seed_map);// This method behaves worse on base0. seg 30 50 150
+            auto r_seed = lookup_rotation_seed(kv.first, rotation_seed_map);  // 默认 allow_nearest_neighbor=false
+            poses.push_back({r_seed[0], r_seed[1], r_seed[2],
                              t_seed[0], t_seed[1], t_seed[2]});
+            // poses.push_back({0.0, 0.0, 0.0,
+            //                  t_seed[0], t_seed[1], t_seed[2]});
         }
         frame_idx++;
     }
@@ -1894,9 +2053,6 @@ int main(int argc, char** argv) {
             const auto& ws_obs = (ws_it != obs_by_frame.end()) ? ws_it->second : empty_obs;
             initialize_pose_per_frame(i, ws_obs, model_obj, Ps, poses[i].data());
 
-            if ((i+1) % 10 == 0 || i+1 == frame_numbers.size()) {
-                cout << "Warm-start initialized " << (i+1) << "/" << frame_numbers.size() << " frames" << endl;
-            }
         }
 
         cout << "Completed warm start for all frames" << endl;
@@ -1969,7 +2125,6 @@ int main(int argc, char** argv) {
         use_motion_track ? "ba_summary_with_motion.csv" : "ba_summary_no_motion.csv");
     save_ba_summary(ba_summary_path, ba_summary, use_motion_track);
     generated_files.push_back(ba_summary_path);
-
 
     // Report the largest pose change introduced by global BA.
     double max_abs = 0.0;
