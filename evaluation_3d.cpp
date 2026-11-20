@@ -116,8 +116,6 @@ struct MethodEvaluation {
 using TrajectoryMap = map<pair<long long, string>, Point3Row>;
 
 static const vector<string> kMethodOrder = {
-    "rigid_no_motion",
-    "rigid_with_motion",
     "restored_no_motion",
     "restored_with_motion"
 };
@@ -771,8 +769,6 @@ void save_point_audit_csv(const string& path,
 int main(int argc, char** argv) {
     string gt_path = "xyz_gt.csv";
     vector<MethodSpec> method_specs = {
-        {"rigid_no_motion", "./results/xyz_no_motion.csv", false, {}},
-        {"rigid_with_motion", "./results/xyz_with_motion.csv", false, {}},
         {"restored_no_motion", "./results/xyz_restored_no_motion.csv", false, {}},
         {"restored_with_motion", "./results/xyz_restored_with_motion.csv", false,
          {"./results/xyz_restored_motion.csv"}}
@@ -783,32 +779,24 @@ int main(int argc, char** argv) {
         string arg = argv[i];
         if (arg == "--gt" && i + 1 < argc) {
             gt_path = argv[++i];
-        } else if (arg == "--rigid-no-motion" && i + 1 < argc) {
+        } else if (arg == "--restored-no-motion" && i + 1 < argc) {
             method_specs[0].path = argv[++i];
             method_specs[0].explicit_path = true;
-        } else if (arg == "--rigid-with-motion" && i + 1 < argc) {
+        } else if (arg == "--restored-with-motion" && i + 1 < argc) {
             method_specs[1].path = argv[++i];
             method_specs[1].explicit_path = true;
-        } else if (arg == "--restored-no-motion" && i + 1 < argc) {
-            method_specs[2].path = argv[++i];
-            method_specs[2].explicit_path = true;
-        } else if (arg == "--restored-with-motion" && i + 1 < argc) {
-            method_specs[3].path = argv[++i];
-            method_specs[3].explicit_path = true;
         } else if (arg == "--no-motion" && i + 1 < argc) {
-            method_specs[2].path = argv[++i];
-            method_specs[2].explicit_path = true;
+            method_specs[0].path = argv[++i];
+            method_specs[0].explicit_path = true;
         } else if ((arg == "--motion" || arg == "--with-motion") && i + 1 < argc) {
-            method_specs[3].path = argv[++i];
-            method_specs[3].explicit_path = true;
+            method_specs[1].path = argv[++i];
+            method_specs[1].explicit_path = true;
         } else if ((arg == "--outdir" || arg == "--output-dir") && i + 1 < argc) {
             output_dir = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             cout << "Usage: " << argv[0] << " [options]\n";
             cout << "Options:\n";
             cout << "  --gt <path>                   GT trajectory CSV (default: xyz_gt.csv)\n";
-            cout << "  --rigid-no-motion <path>      rigid no-motion CSV (default: ./results/xyz_no_motion.csv)\n";
-            cout << "  --rigid-with-motion <path>    rigid with-motion CSV (default: ./results/xyz_with_motion.csv)\n";
             cout << "  --restored-no-motion <path>   restored no-motion CSV (default: ./results/xyz_restored_no_motion.csv)\n";
             cout << "  --restored-with-motion <path> restored with-motion CSV (default: ./results/xyz_restored_with_motion.csv)\n";
             cout << "  --no-motion <path>            Compatibility alias for --restored-no-motion\n";
@@ -838,10 +826,17 @@ int main(int argc, char** argv) {
 
     unordered_set<long long> missing_cam_frames;
     {
-        const string audit_path_primary = resolve_input_path(
-            "results/diagnostics/anomaly_missing_obs.csv", executable_dir);
-        const string audit_path_fallback = resolve_input_path(
-            "results/anomaly_missing_obs.csv", executable_dir);
+        // const string audit_path_primary = resolve_input_path(
+        //     "results/diagnostics/anomaly_missing_obs.csv", executable_dir);
+        // const string audit_path_fallback = resolve_input_path(
+        //     "results/anomaly_missing_obs.csv", executable_dir);
+        
+
+        const string audit_path_primary = join_path(
+            join_path(output_dir, "diagnostics"), "anomaly_missing_obs.csv");
+        const string audit_path_fallback = join_path(
+            output_dir, "anomaly_missing_obs.csv");
+
         const string audit_path = file_exists(audit_path_primary)
             ? audit_path_primary
             : audit_path_fallback;
@@ -906,6 +901,60 @@ int main(int argc, char** argv) {
         cerr << "ERROR: No prediction inputs were available. Provide at least one rigid/restored trajectory." << endl;
         return -1;
     }
+
+    // ── init基线评估(可选、自动探测,不需要CLI参数) ──
+    // init不是一种"求解方法",是BA求解前的起点;若diagnostics/xyz_init.csv存在就顺手
+    // 评估一次,单独存到diagnostics/,不参与method_sort_rank排序,不写入主三张表。
+    {
+        const string init_xyz_candidate = resolve_input_path(
+            "results/diagnostics/xyz_init.csv", executable_dir);
+        const string init_xyz_fallback = join_path(
+            join_path(output_dir, "diagnostics"), "xyz_init.csv");
+        const string resolved_init_path = file_exists(init_xyz_candidate)
+            ? init_xyz_candidate
+            : init_xyz_fallback;
+
+        if (!file_exists(resolved_init_path)) {
+            cout << "No xyz_init.csv found at " << resolved_init_path
+                 << "; skipping init baseline evaluation." << endl;
+        } else {
+            TrajectoryMap init_pred = load_trajectory_csv(resolved_init_path);
+            if (init_pred.empty()) {
+                cout << "WARNING: Failed to load xyz_init.csv; skipping init evaluation." << endl;
+            } else if (!validate_prediction_alignment("init", resolved_init_path, gt, init_pred)) {
+                cout << "WARNING: xyz_init.csv failed alignment check; skipping init evaluation." << endl;
+            } else {
+                MethodEvaluation init_eval = evaluate_method(
+                    "init", resolved_init_path, gt, init_pred, missing_cam_frames);
+
+                cout << "init: gt_points=" << init_eval.overall_row.gt_total_points
+                     << ", rmse_3d=" << format_double_or_empty(init_eval.overall_row.rmse_3d)
+                     << "  (reference baseline, not part of method comparison)" << endl;
+
+                const string diag_dir = join_path(output_dir, "diagnostics");
+                ensure_directory(diag_dir);
+
+                vector<OverallSummaryRow> init_overall_rows = {init_eval.overall_row};
+                vector<FrameSummaryRow> init_frame_rows = init_eval.frame_rows;
+                sort(init_frame_rows.begin(), init_frame_rows.end(),
+                     [](const FrameSummaryRow& a, const FrameSummaryRow& b) {
+                         return a.frame < b.frame;
+                     });
+                vector<PartSummaryRow> init_part_rows = init_eval.part_rows;
+                sort(init_part_rows.begin(), init_part_rows.end(),
+                     [](const PartSummaryRow& a, const PartSummaryRow& b) {
+                         return a.part < b.part;
+                     });
+
+                save_overall_csv(join_path(diag_dir, "eval_3d_init_overall.csv"), init_overall_rows);
+                save_frame_audit_csv(join_path(diag_dir, "eval_3d_init_frame.csv"), init_frame_rows);
+                save_part_csv(join_path(diag_dir, "eval_3d_init_part.csv"), init_part_rows);
+
+                cout << "Saved init baseline evaluation to " << diag_dir
+                     << "/eval_3d_init_{overall,frame,part}.csv" << endl;
+            }
+        }
+    } 
 
     vector<PointAuditRow> all_point_rows;
     vector<FrameSummaryRow> all_frame_rows;
