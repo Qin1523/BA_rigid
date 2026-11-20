@@ -662,7 +662,7 @@ bool estimate_initial_rotation_seeds(
 array<double, 3> lookup_rotation_seed(
     long long frame,
     const map<long long, array<double, 3>>& rotation_seed_map,
-    bool allow_nearest_neighbor = false,
+    bool allow_nearest_neighbor = true,
     long long max_distance = 5) {
 
     auto exact = rotation_seed_map.find(frame);
@@ -775,8 +775,8 @@ bool compute_template_body_scale_stats(
 // Reprojection residual for one observation with a fixed template point.
 struct PoseReprojCost {
     PoseReprojCost(const cv::Mat& P, const array<double, 3>& X_obj,
-                   double u_obs, double v_obs)
-        : X_obj_(X_obj), u_obs_(u_obs), v_obs_(v_obs) {
+                   double u_obs, double v_obs, double weight = 1.0)
+        : X_obj_(X_obj), u_obs_(u_obs), v_obs_(v_obs), weight_(weight){
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 4; j++)
                 P_[i * 4 + j] = P.at<double>(i, j);
@@ -818,23 +818,27 @@ struct PoseReprojCost {
         v_pred /= w_pred;
 
         // Residual in image space.
-        residuals[0] = u_pred - T(u_obs_);
-        residuals[1] = v_pred - T(v_obs_);
+        // residuals[0] = u_pred - T(u_obs_); 
+        // residuals[1] = v_pred - T(v_obs_);
+        residuals[0] = T(weight_) * (u_pred - T(u_obs_));
+        residuals[1] = T(weight_) * (v_pred - T(v_obs_));
 
         return true;
     }
 
     static ceres::CostFunction* Create(const cv::Mat& P,
                                        const array<double, 3>& X_obj,
-                                       double u, double v) {
+                                       double u, double v, double weight = 1.0) {
         return new ceres::AutoDiffCostFunction<PoseReprojCost, 2, 6>(
-            new PoseReprojCost(P, X_obj, u, v));
+            new PoseReprojCost(P, X_obj, u, v, weight));
     }
 
 private:
     double P_[12];
     array<double, 3> X_obj_;
     double u_obs_, v_obs_;
+    double weight_;   // sqrt(part_weight)，因为 Ceres 内部会对residual平方求和
+
 };
 
 // Four-point cubic interpolation used to predict the center frame from
@@ -1017,9 +1021,19 @@ ceres::Solver::Summary global_bundle_adjustment(
     double lambda,
     double grid_step,
     const array<double, 3>& motion_track_center_obj,
-    double body_scale){
+    double body_scale,
+    const map<string, double>& part_weights,
+    //cost输出
+    std::vector<double>* out_reproj_cost = nullptr,   // per-frame真实重投影cost(含Huber)
+    std::vector<double>* out_track_cost  = nullptr){  // per-frame真实motion-track cost(含λ,normalization)
 
     ceres::Problem prob;
+
+    //cost输出
+    // 按帧记录残差块id,供收敛后逐帧Evaluate真实cost
+    std::vector<std::vector<ceres::ResidualBlockId>> reproj_ids(frame_numbers.size());
+    std::vector<ceres::ResidualBlockId> track_ids(frame_numbers.size(), nullptr);
+
     ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
     static const vector<Obs2> empty_obs;
 
@@ -1034,10 +1048,20 @@ ceres::Solver::Summary global_bundle_adjustment(
 
             const auto& X_obj = model_obj.at(ob.part);
 
-            ceres::CostFunction* cost = PoseReprojCost::Create(
-                Ps[ob.cam], X_obj, ob.u, ob.v);
+            double w = 1.0;
+            auto wit = part_weights.find(ob.part);
+            if (wit != part_weights.end()) w = std::sqrt(wit->second);
 
-            prob.AddResidualBlock(cost, loss, poses[i].data());
+            ceres::CostFunction* cost = PoseReprojCost::Create(
+                Ps[ob.cam], X_obj, ob.u, ob.v, w);
+
+            // ceres::CostFunction* cost = PoseReprojCost::Create(
+                // Ps[ob.cam], X_obj, ob.u, ob.v);
+
+            // prob.AddResidualBlock(cost, loss, poses[i].data());
+
+            //cost输出
+            reproj_ids[i].push_back(prob.AddResidualBlock(cost, loss, poses[i].data()));
         }
     }
 
@@ -1050,7 +1074,9 @@ ceres::Solver::Summary global_bundle_adjustment(
             ceres::CostFunction* cost =
                 MotionTrackGridCost::Create(weight, grid_step, motion_track_center_obj, body_scale);
 
-            prob.AddResidualBlock(cost, nullptr,
+            // prob.AddResidualBlock(cost, nullptr,
+            //cost输出
+            track_ids[i] = prob.AddResidualBlock(cost, nullptr,
                 poses[i-2].data(),
                 poses[i-1].data(),
                 poses[i].data(),
@@ -1075,9 +1101,39 @@ ceres::Solver::Summary global_bundle_adjustment(
     ceres::Solver::Summary summary;
     ceres::Solve(options, &prob, &summary);
 
+    //cost输出
+    // ── 收敛后:逐帧取每类残差块的真实cost(0.5·Σρ(‖f‖²)) ──
+    // reproj: apply_loss_function=true → 含Huber降权
+    // track : 无loss,纯二次,cost = 0.5·Σ_81 (√λ·Δ/body_scale)² = 13.5·λ/body_scale²·rmse_mm²
+    if (out_reproj_cost || out_track_cost) {
+        if (out_reproj_cost) out_reproj_cost->assign(frame_numbers.size(), 0.0);
+        if (out_track_cost)  out_track_cost->assign(frame_numbers.size(), 0.0);
+
+        ceres::Problem::EvaluateOptions eopt;
+        eopt.apply_loss_function = true;   // 关键:cost里包含Huber
+        eopt.num_threads = options.num_threads;
+
+        for (size_t i = 0; i < frame_numbers.size(); i++) {
+            double c = 0.0;
+            if (out_reproj_cost && !reproj_ids[i].empty()) {
+                eopt.residual_blocks = reproj_ids[i];
+                prob.Evaluate(eopt, &c, nullptr, nullptr, nullptr);
+                (*out_reproj_cost)[i] = c;
+            }
+            if (out_track_cost && track_ids[i] != nullptr) {
+                eopt.residual_blocks = { track_ids[i] };
+                c = 0.0;
+                prob.Evaluate(eopt, &c, nullptr, nullptr, nullptr);
+                (*out_track_cost)[i] = c;
+            }
+        }
+    }
+
     cout << summary.BriefReport() << endl;
     return summary;
 }
+
+
 
 // ============================================================================
 // Helper functions for error evaluation
@@ -1166,6 +1222,57 @@ ReprojError compute_reproj_error(const cv::Mat& P,
     err.error_px = sqrt(err.du * err.du + err.dv * err.dv);
 
     return err;
+}
+
+map<string, double> compute_part_weights_from_residuals(
+    map<long long, vector<Obs2>>& obs_by_frame,
+    const unordered_map<string, array<double,3>>& model_obj,
+    const vector<cv::Mat>& Ps,
+    const vector<array<double,6>>& poses,
+    const vector<long long>& frame_numbers,
+    double floor_value = 0.1)
+{
+    // 建立 frame -> pose index 的映射
+    unordered_map<long long, size_t> frame_to_idx;
+    for (size_t i = 0; i < frame_numbers.size(); i++)
+        frame_to_idx[frame_numbers[i]] = i;
+
+    map<string, vector<double>> residual_by_part;
+
+    for (auto& [fr, obs_frame] : obs_by_frame) {
+        auto it = frame_to_idx.find(fr);
+        if (it == frame_to_idx.end()) continue;
+        const auto& pose = poses[it->second];
+
+        for (const auto& ob : obs_frame) {
+            if (!model_obj.count(ob.part)) continue;
+            const auto& X_obj = model_obj.at(ob.part);
+
+            // 用当前 pose 重投影，算残差范数（直接复用 compute_reproj_error）
+            ReprojError err = compute_reproj_error(Ps[ob.cam], pose, X_obj, ob.u, ob.v);
+            residual_by_part[ob.part].push_back(err.error_px);
+        }
+    }
+
+    map<string, double> weights;
+    for (auto& [part, residuals] : residual_by_part) {
+        std::sort(residuals.begin(), residuals.end());
+        double med = residuals[residuals.size()/2];
+        vector<double> abs_dev;
+        for (double r : residuals) abs_dev.push_back(std::abs(r - med));
+        std::sort(abs_dev.begin(), abs_dev.end());
+        double mad = abs_dev[abs_dev.size()/2];
+        double sigma = mad / 0.6745;
+        weights[part] = 1.0 / std::max(sigma, floor_value);
+    }
+
+    // 归一化：让权重均值为1，避免整体lambda尺度漂移
+    double mean_w = 0;
+    for (auto& [p, w] : weights) mean_w += w;
+    mean_w /= weights.size();
+    for (auto& [p, w] : weights) w /= mean_w;
+
+    return weights;
 }
 
 TrackErrorStats compute_track_error_for_frame(
@@ -1434,6 +1541,29 @@ void save_track_frame_errors(
     cout << "Saved motion-track errors (per frame) to " << path << endl;
 }
 
+//cost输出
+void save_cost_balance(
+    const string& path,
+    const vector<long long>& frame_numbers,
+    const vector<double>& reproj_cost,
+    const vector<double>& track_cost,
+    double fps) {
+
+    ofstream ofs(path);
+    if (!ofs.is_open()) {
+        cerr << "ERROR: Cannot write " << path << endl;
+        return;
+    }
+    // 两列都是Ceres真实cost(无量纲),含Huber/λ/normalization,可直接比高低
+    ofs << "frame,t,reproj_cost,track_cost\n";
+    for (size_t i = 0; i < frame_numbers.size(); i++) {
+        double rc = (i < reproj_cost.size()) ? reproj_cost[i] : 0.0;
+        double tc = (i < track_cost.size())  ? track_cost[i]  : 0.0;
+        ofs << frame_numbers[i] << "," << (frame_numbers[i] / fps) << ","
+            << rc << "," << tc << "\n";
+    }
+    cout << "Saved per-frame cost balance to " << path << endl;
+}
 // ============================================================================
 // 7) Output writers
 // ============================================================================
@@ -1455,12 +1585,12 @@ void save_poses(const string& path,
     for (size_t i = 0; i < frame_numbers.size(); i++) {
         long long fr = frame_numbers[i];
         double t = fr / fps;
-        int restored_flag = gap_frame_set.count(fr) ? 2 : 0;
+        int gap_flag = gap_frame_set.count(fr) ? 1 : 0;
         ofs << fr << "," << t << ","
             << poses[i][0] << "," << poses[i][1] << "," << poses[i][2] << ","
             << poses[i][3] << "," << poses[i][4] << "," << poses[i][5] << ","
             << (use_motion_track ? 1 : 0) << ","
-            << restored_flag << "\n";
+            << gap_flag << "\n";
     }
 
     cout << "Saved poses to " << path << endl;
@@ -1632,7 +1762,8 @@ void save_run_config(const string& path,
                      double motion_track_body_scale,
                      size_t num_frames_observed,
                      size_t num_frames_gap,
-                     size_t num_frames_total) {
+                     size_t num_frames_total,
+                     const string& log_file) {
     ofstream ofs(path);
     if (!ofs.is_open()) {
         cerr << "ERROR: Cannot write " << path << endl;
@@ -1649,7 +1780,8 @@ void save_run_config(const string& path,
     ofs << "  \"motion_track_body_scale_mm\": " << motion_track_body_scale << ",\n";
     ofs << "  \"num_frames_observed\": " << num_frames_observed << ",\n";
     ofs << "  \"num_frames_gap\": " << num_frames_gap << ",\n";
-    ofs << "  \"num_frames_total\": " << num_frames_total << "\n";
+    ofs << "  \"num_frames_total\": " << num_frames_total << ",\n";
+    ofs << "  \"log_file\": \"" << log_file << "\"\n";   // 新增
     ofs << "}\n";
     cout << "Saved run config to " << path << endl;
 }
@@ -1762,13 +1894,16 @@ int main(int argc, char** argv) {
     string output_dir = "results";
     string mt_center_part = "";
     bool mt_center_part_specified = false;
+    string input_dir = "";  // If set, overrides front/side/top defaults.
+
 
     double fps = 30.0;
     bool use_warm_start = false;
     bool use_motion_track = false;   // Motion-track is off unless explicitly enabled.
     double lambda = 1.0;             // Motion-track weight.
-    double grid_step = 25.0;         // Virtual grid spacing in mm.
+    double grid_step = 16;         // Virtual grid spacing in mm.  25.0
     int frame_stride = 1;            // 1 = use every frame, 2 = use every other frame, etc.
+    bool enable_weighting = false;  // Per-part IRLS reprojection weighting is off unless explicitly enabled.
 
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++) {
@@ -1781,6 +1916,10 @@ int main(int argc, char** argv) {
             use_motion_track = true;
         } else if (arg == "--no-motion-track") {
             use_motion_track = false;
+        } else if (arg == "--weight") {
+            enable_weighting = true;
+        } else if (arg == "--no-weight") {
+            enable_weighting = false;
         } else if (arg == "--lambda" && i+1 < argc) {
             lambda = stod(argv[++i]);
         } else if ((arg == "--grid-step" || arg == "--grid_step") && i+1 < argc) {
@@ -1789,6 +1928,8 @@ int main(int argc, char** argv) {
             frame_stride = stoi(argv[++i]);
         } else if (arg == "--cams" && i+1 < argc) {
             cams_path = argv[++i];
+        } else if (arg == "--input-dir" && i+1 < argc) {
+            input_dir = argv[++i];
         } else if (arg == "--front" && i+1 < argc) {
             front_csv = argv[++i];
         } else if (arg == "--side" && i+1 < argc) {
@@ -1806,6 +1947,7 @@ int main(int argc, char** argv) {
             cout << "Usage: " << argv[0] << " [options]\n";
             cout << "Options:\n";
             cout << "  --cams <path>       Camera file path (default: 3cam/cams.txt)\n";
+            cout << "  --input-dir <dir>   Directory containing obs_de_*.csv files\n";
             cout << "  --front <path>      Front camera CSV (default: 3cam/obs_de_front.csv)\n";
             cout << "  --side <path>       Side camera CSV (default: 3cam/obs_de_side.csv)\n";
             cout << "  --top <path>        Top camera CSV (default: 3cam/obs_de_top.csv)\n";
@@ -1814,6 +1956,8 @@ int main(int argc, char** argv) {
             cout << "  --warm-start        Enable per-frame pose warm start\n";
             cout << "  --motion-track      Enable motion-track constraint\n";
             cout << "  --no-motion-track   Disable motion-track constraint\n";
+            cout << "  --weight       Enable per-part IRLS reprojection weighting\n";
+            cout << "  --no-weight    Disable per-part IRLS reprojection weighting\n";
             cout << "  --lambda <value>    Motion-track weight (default: 1.0)\n";
             cout << "  --grid-step <value> Grid step in mm (default: 25.0)\n";
             cout << "  --grid_step <value> Alias for --grid-step\n";
@@ -1824,6 +1968,14 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
+
+    // 在参数解析循环结束之后、resolve_input_path 之前加：
+    if (!input_dir.empty()) {
+        front_csv = join_path(input_dir, "obs_de_front.csv");
+        side_csv  = join_path(input_dir, "obs_de_side.csv");
+        top_csv   = join_path(input_dir, "obs_de_top.csv");
+    }
+    // 之后原有的 resolve_input_path 照常执行
 
     const string executable_dir = get_executable_dir(argv[0]);
     cams_path = resolve_input_path(cams_path, executable_dir);
@@ -1845,6 +1997,58 @@ int main(int argc, char** argv) {
     cout << "Resolved template CSV: " << template_path << endl;
     cout << "Output directory: " << output_dir << endl;
     cout << endl;
+
+    // ---- 把终端log同时写入文件 ----
+    class TeeBuf : public std::streambuf {
+    public:
+        TeeBuf(std::streambuf* b1, std::streambuf* b2) : buf1(b1), buf2(b2) {}
+    protected:
+        int overflow(int c) override {
+            if (c == EOF) return !EOF;
+            int r1 = buf1->sputc((char)c);
+            int r2 = buf2->sputc((char)c);
+            return (r1 == EOF || r2 == EOF) ? EOF : c;
+        }
+        int sync() override {
+            int r1 = buf1->pubsync();
+            int r2 = buf2->pubsync();
+            return (r1 == 0 && r2 == 0) ? 0 : -1;
+        }
+    private:
+        std::streambuf* buf1;
+        std::streambuf* buf2;
+    };
+
+    const string log_suffix = use_motion_track ? "_with_motion" : "_no_motion";
+    const string log_dir = join_path(output_dir, "diagnostics");
+    ensure_directory(output_dir);
+    ensure_directory(log_dir);
+    const string run_log_path = join_path(log_dir, "run_log" + log_suffix + ".txt");
+
+    ofstream log_ofs(run_log_path);
+    if (!log_ofs.is_open()) {
+        cerr << "WARNING: Cannot open log file " << run_log_path << endl;
+    }
+
+    TeeBuf tee_cout(std::cout.rdbuf(), log_ofs.rdbuf());
+    TeeBuf tee_cerr(std::cerr.rdbuf(), log_ofs.rdbuf());
+
+    // RAII guard：保证main()任何return路径都会恢复原始的cout/cerr缓冲区，
+    // 避免局部TeeBuf析构后cout/cerr残留悬空指针。
+    struct CoutTeeGuard {
+        std::streambuf* orig_cout;
+        std::streambuf* orig_cerr;
+        ~CoutTeeGuard() {
+            std::cout.rdbuf(orig_cout);
+            std::cerr.rdbuf(orig_cerr);
+        }
+    } tee_guard{std::cout.rdbuf(), std::cerr.rdbuf()};
+
+    std::cout.rdbuf(&tee_cout);
+    std::cerr.rdbuf(&tee_cerr);
+
+    cout << "Run log will be saved to: " << run_log_path << endl;
+    // ---- tee设置结束 ----
 
     // 1) Load input data.
     cout << "Step 1: Loading data..." << endl;
@@ -1997,7 +2201,7 @@ int main(int argc, char** argv) {
 
     // Observation quality audit - run once, independent of with/no_motion.
     {
-        const string audit_path = join_path(output_dir, "anomaly_missing_obs.csv");
+        const string audit_path = join_path(diag_dir, "anomaly_missing_obs.csv");
         if (!file_exists(audit_path)) {
             save_observation_audit(audit_path, obs_by_frame, gap_frame_set,
                                    part_order, 3, fps);
@@ -2030,13 +2234,6 @@ int main(int argc, char** argv) {
              << " out of " << obs_by_frame.size() << " frames)" << endl;
     }
 
-    {
-        const string init_pose_path = join_path(diag_dir, "init_pose.csv");
-        if (!file_exists(init_pose_path)) {
-            save_poses(init_pose_path, frame_numbers, poses, fps, false, gap_frame_set);
-            generated_files.push_back(init_pose_path);
-        }
-    }
     // 3.3 warm start
 
     if (use_warm_start) {
@@ -2103,22 +2300,73 @@ int main(int argc, char** argv) {
     auto poses_before_ba = poses; // Sanity check that global BA actually updates the trajectory.
 
     // Output pre-BA reprojection diagnostics for before/after comparison.
+    // Explicitly anchored to poses_before_ba (not poses) so this stays correct
+    // even if future edits insert code between the snapshot and this block.
     {
         const string pre_reproj_frame_path = join_path(diag_dir, "pre_ba_reproj_frame.csv");
         if (!file_exists(pre_reproj_frame_path)) {
             save_all_reproj_diagnostics(diag_dir, "pre_ba_reproj", "",
-                                        obs_by_frame, frame_numbers, poses,
+                                        obs_by_frame, frame_numbers, poses_before_ba,
                                         model_obj, Ps, fps, generated_files);
         }
     }
 
-    // 4) Run the global BA refinement.
-    cout << "\nStep 4: Global bundle adjustment..." << endl;
+    // ── init快照:warm-start(若开启)+ gap插值都已完成、BA尚未运行的完整起点 ──
+    // 同样显式使用poses_before_ba。frame_numbers此时已含全部gap帧,
+    // restored能正确标到2(不再像旧版那样在gap-frame合并前写出导致整行缺失)。
+    {
+        const string init_pose_path = join_path(diag_dir, "init_pose.csv");
+        if (!file_exists(init_pose_path)) {
+            save_poses(init_pose_path, frame_numbers, poses_before_ba, fps, false, gap_frame_set);
+            generated_files.push_back(init_pose_path);
+        }
+        const string init_xyz_path = join_path(diag_dir, "xyz_init.csv");
+        if (!file_exists(init_xyz_path)) {
+            save_restored_3d_points(init_xyz_path, obs_by_frame, frame_numbers, poses_before_ba,
+                                    model_obj, part_order, fps,
+                                    static_cast<int>(Ps.size()), gap_frame_set);
+            generated_files.push_back(init_xyz_path);
+        }
+    }
 
-    ceres::Solver::Summary ba_summary =
-        global_bundle_adjustment(obs_by_frame, model_obj, Ps, poses, frame_numbers,
-                                 use_motion_track, lambda, grid_step, motion_track_center_obj,
-                                 motion_track_body_scale);
+    // // 4) Run the global BA refinement.
+    // cout << "\nStep 4: Global bundle adjustment..." << endl;
+    //cost输出
+    // std::vector<double> reproj_cost_pf, track_cost_pf;
+
+    // ceres::Solver::Summary ba_summary =
+    //     global_bundle_adjustment(obs_by_frame, model_obj, Ps, poses, frame_numbers,
+    //                              use_motion_track, lambda, grid_step, motion_track_center_obj,
+    //                              motion_track_body_scale,
+    //                             &reproj_cost_pf, &track_cost_pf);//cost输出
+    // 4) Run the global BA refinement (IRLS: alternate BA and per-part weight update).
+    cout << "\nStep 4: Global bundle adjustment (IRLS per-part weighting)..." << endl;
+
+    map<string, double> part_weights;  // empty = all weights default to 1.0 on first pass
+    ceres::Solver::Summary ba_summary;
+    std::vector<double> reproj_cost_pf, track_cost_pf;  
+
+    const int irls_max_iter = enable_weighting ? 5 : 1;  // OFF: 只跑1轮，权重恒为默认1.0
+    for (int irls_iter = 0; irls_iter < irls_max_iter; irls_iter++) {
+        if (enable_weighting) {
+            cout << "  [IRLS] iteration " << irls_iter << " ..." << endl;
+        }
+
+        ba_summary =
+            global_bundle_adjustment(obs_by_frame, model_obj, Ps, poses, frame_numbers,
+                                    use_motion_track, lambda, grid_step, motion_track_center_obj,
+                                    motion_track_body_scale, part_weights, &reproj_cost_pf, &track_cost_pf);
+
+        if (enable_weighting) {
+            part_weights = compute_part_weights_from_residuals(
+                obs_by_frame, model_obj, Ps, poses, frame_numbers);
+
+            cout << "  [IRLS] updated part weights:" << endl;
+            for (auto& kv : part_weights) {
+                cout << "    " << kv.first << ": " << kv.second << endl;
+            }
+        }
+    }
 
     const string ba_summary_path = join_path(
         diag_dir,
@@ -2126,14 +2374,43 @@ int main(int argc, char** argv) {
     save_ba_summary(ba_summary_path, ba_summary, use_motion_track);
     generated_files.push_back(ba_summary_path);
 
-    // Report the largest pose change introduced by global BA.
-    double max_abs = 0.0;
-    for (size_t i = 0; i < poses.size(); i++) {
-        for (int k = 0; k < 6; k++) {
-            max_abs = std::max(max_abs, std::abs(poses[i][k] - poses_before_ba[i][k]));
+    // Report the largest pose-induced 3D displacement introduced by global BA (mm单位, 物理意义更直观).
+    // 用模板上的实际关键点，而不是原始的角度轴+平移六元组直接相减——
+    // 这样旋转和平移的贡献会一起折算成真实的空间位移（mm），可以直接跟RMSE指标比较。
+    {
+        double max_disp_mm = 0.0;
+        long long max_disp_frame = -1;
+        string max_disp_part;
+
+        for (size_t i = 0; i < poses.size(); i++) {
+            const auto& pose_before = poses_before_ba[i];
+            const auto& pose_after  = poses[i];
+
+            for (const auto& kv : model_obj) {
+                const string& part   = kv.first;
+                const auto&   X_obj  = kv.second;
+
+                array<double, 3> X_before, X_after;
+                apply_pose_transform(pose_before, X_obj, X_before);
+                apply_pose_transform(pose_after,  X_obj, X_after);
+
+                double dx = X_after[0] - X_before[0];
+                double dy = X_after[1] - X_before[1];
+                double dz = X_after[2] - X_before[2];
+                double disp = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+                if (disp > max_disp_mm) {
+                    max_disp_mm    = disp;
+                    max_disp_frame = frame_numbers[i];
+                    max_disp_part  = part;
+                }
+            }
         }
+
+        std::cout << "[check] max |pose_after - pose_before| = " << max_disp_mm
+                   << " mm (frame " << max_disp_frame
+                   << ", part '" << max_disp_part << "')" << std::endl;
     }
-    std::cout << "[check] max |pose_after - pose_before| = " << max_abs << std::endl;
 
     // 5) Save final evaluation outputs.
     cout << "\nStep 5: Saving evaluation outputs..." << endl;
@@ -2153,7 +2430,8 @@ int main(int argc, char** argv) {
             motion_track_body_scale,
             obs_by_frame.size(),
             gap_frames.size(),
-            frame_numbers.size());
+            frame_numbers.size(),
+            run_log_path);
         generated_files.push_back(config_path);
     }
 
@@ -2184,6 +2462,12 @@ int main(int argc, char** argv) {
             save_track_frame_errors(track_frame_path, frame_numbers, poses,
                                     motion_track_center_obj, grid_step, fps);
             generated_files.push_back(track_frame_path);
+
+            //cost输出
+            const string cost_balance_path = join_path(diag_dir, "cost_balance" + suffix + ".csv");
+            save_cost_balance(cost_balance_path, frame_numbers,
+                              reproj_cost_pf, track_cost_pf, fps);
+            generated_files.push_back(cost_balance_path);
         }
     }
 
